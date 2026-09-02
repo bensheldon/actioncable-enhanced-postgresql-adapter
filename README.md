@@ -250,4 +250,5 @@ It returns `[]` if nothing has been stored for that channel, or if `reliable_bro
 
 - Clone repo
 - `bundle install` to install dependencies
-- `bundle exec rake test` to run the full test suite
+- `bundle exec ruby test/postgresql_test.rb` to run the adapter tests
+- `bundle exec ruby test/reliable_broadcasting_test.rb` to run the reliable broadcasting integration tests

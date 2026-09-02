@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 require_relative "test_helper"
-require_relative "postgresql_setup"
 
 require "active_record"
 require "active_support/core_ext/hash/indifferent_access"
@@ -83,9 +82,39 @@ class ReplayTestController < ActionController::Base
 end
 
 class ReliableBroadcastingChannelTest < ActionCable::TestCase
-  include PostgresqlAdapterSetup
-
   CONFIRMATION_TYPE = ActionCable::INTERNAL[:message_types][:confirmation]
+
+  def setup
+    database_config = { "adapter" => "postgresql", "database" => "actioncable_enhanced_postgresql_test" }
+
+    # Create the database unless it already exists
+    begin
+      ActiveRecord::Base.establish_connection database_config.merge("database" => "postgres")
+      ActiveRecord::Base.connection.create_database database_config["database"], encoding: "utf8"
+    rescue ActiveRecord::DatabaseAlreadyExists
+    end
+
+    # Connect to the database
+    ActiveRecord::Base.establish_connection database_config
+
+    begin
+      ActiveRecord::Base.connection.connect!
+    rescue
+      skip "Couldn't connect to PostgreSQL: #{database_config.inspect}"
+    end
+
+    super
+  end
+
+  def teardown
+    super
+
+    ActiveRecord::Base.connection_handler.clear_all_connections!
+  end
+
+  def cable_config
+    { adapter: "enhanced_postgresql", payload_encryptor_secret: SecureRandom.hex(16) }
+  end
 
   def test_replays_messages_broadcast_before_subscribing_in_order_and_still_delivers_live_messages
     server = build_server
