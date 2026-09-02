@@ -2,7 +2,11 @@
 
 require "debug"
 
-require "active_support/testing/strict_warnings"
+begin
+  require "active_support/testing/strict_warnings"
+rescue LoadError
+  # Not available in every ActiveSupport version
+end
 require "action_cable"
 require "active_support/testing/autorun"
 require "active_support/testing/method_call_assertions"
