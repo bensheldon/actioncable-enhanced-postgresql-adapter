@@ -252,3 +252,4 @@ It returns `[]` if nothing has been stored for that channel, or if `reliable_bro
 - `bundle install` to install dependencies
 - `bundle exec ruby test/postgresql_test.rb` to run the adapter tests
 - `bundle exec ruby test/reliable_broadcasting_test.rb` to run the reliable broadcasting integration tests
+- `bundle exec ruby test/system/hotwire_reliable_broadcasting_test.rb` to run the Hotwire Turbo Streams system test - it boots a minimal Rails app under `test/dummy` and drives it with a real, headless Chromium via Capybara/Cuprite; set `BROWSER_PATH` if Chromium isn't auto-detected

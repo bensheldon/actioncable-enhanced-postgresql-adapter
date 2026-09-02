@@ -1,1 +1,5 @@
 Gemfile.lock
+test/dummy/log/*
+!test/dummy/log/.keep
+test/dummy/tmp/*
+!test/dummy/tmp/.keep

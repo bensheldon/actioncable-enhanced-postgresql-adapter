@@ -1,0 +1,9 @@
+<h1>Room</h1>
+
+<% if @reliable %>
+  <%= turbo_stream_from @room, data: { since: action_cable_since_param } %>
+<% else %>
+  <%= turbo_stream_from @room %>
+<% end %>
+
+<div id="messages"></div>
