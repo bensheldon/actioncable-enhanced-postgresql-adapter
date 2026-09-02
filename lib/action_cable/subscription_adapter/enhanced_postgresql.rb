@@ -214,3 +214,5 @@ module ActionCable
     end
   end
 end
+
+require_relative "enhanced_postgresql/reliable_broadcasting"
