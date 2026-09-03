@@ -15,12 +15,6 @@ class ActionCable::SubscriptionAdapter::EnhancedPostgresql
         ReliableBroadcasting.encrypt_since(time || (@action_cable_since ||= Time.now.utc), action_cable_param_encryptor)
       end
 
-      # <meta name="action-cable-enhanced-since" content="..."> - read from JS via
-      # ActionCable.getConfig("enhanced-since").
-      def action_cable_enhanced_since_meta_tag
-        tag("meta", name: ReliableBroadcasting::META_TAG_NAME, content: action_cable_enhanced_since_param)
-      end
-
       # An encrypted-and-signed token of `value.to_s`, suitable for a channel param or a data-*
       # attribute (typically `turbo_stream_from @room, data: { enhanced_presence:
       # action_cable_enhanced_presence_param(current_user.name) }`), for use with

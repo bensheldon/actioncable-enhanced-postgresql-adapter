@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-# An end-to-end test of the "Option B: Hotwire Turbo Streams" walkthrough from the README's
+# An end-to-end test of the "Hotwire Turbo Streams" walkthrough from the README's
 # "Reliable broadcasting" section: a real (dummy) Rails app, a real browser (via Capybara +
 # Cuprite/Chromium), and a real Postgres-backed enhanced_postgresql adapter with
 # reliable_broadcasting enabled.

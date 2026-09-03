@@ -103,6 +103,12 @@ class PostgresqlAdapterTest < ActionCable::TestCase
       # The large payload is stored in the database at this point
       assert_equal 1, ActiveRecord::Base.connection.query("SELECT COUNT(*) FROM #{large_payloads_table}").first.first
 
+      # ...but encrypted-and-signed at rest, not as the raw payload a client could read straight
+      # out of the database.
+      raw_payload = ActiveRecord::Base.connection.select_value("SELECT payload FROM #{large_payloads_table} LIMIT 1")
+      refute_equal large_payload, raw_payload
+      refute_includes raw_payload, large_payload
+
       assert_equal large_payload, queue.pop
     end
   end
@@ -218,6 +224,65 @@ class PostgresqlAdapterTest < ActionCable::TestCase
     end
 
     assert_equal 1, ActiveRecord::Base.connection.query("SELECT COUNT(*) FROM #{ActionCable::SubscriptionAdapter::EnhancedPostgresql::BROADCASTS_TABLE}").first.first
+  end
+
+  def test_reliable_broadcasting_stores_payload_encrypted_at_rest
+    drop_messages_table
+
+    adapter = build_adapter(reliable_broadcasting: true)
+    t0 = Time.now.utc
+
+    subscribe_as_queue("channel", adapter) do |queue|
+      adapter.broadcast("channel", "hello world")
+      assert_equal "hello world", queue.pop
+    end
+
+    raw_payload = ActiveRecord::Base.connection.select_value(
+      "SELECT payload FROM #{ActionCable::SubscriptionAdapter::EnhancedPostgresql::BROADCASTS_TABLE} LIMIT 1"
+    )
+    refute_equal "hello world", raw_payload
+    refute_includes raw_payload, "hello world"
+
+    assert_equal ["hello world"], adapter.messages_since("channel", t0).map(&:payload)
+  end
+
+  def test_messages_since_skips_a_row_with_an_undecryptable_payload
+    drop_messages_table
+
+    adapter = build_adapter(reliable_broadcasting: true)
+    t0 = Time.now.utc
+
+    adapter.broadcast("channel", "good before")
+
+    pg_conn = ActiveRecord::Base.connection.raw_connection
+    pg_conn.exec_params(
+      "INSERT INTO #{ActionCable::SubscriptionAdapter::EnhancedPostgresql::BROADCASTS_TABLE} (channel, payload, created_at) VALUES ($1, $2, CURRENT_TIMESTAMP)",
+      [adapter.send(:channel_with_prefix, "channel"), "garbage-not-encrypted"]
+    )
+
+    adapter.broadcast("channel", "good after")
+
+    assert_equal ["good before", "good after"], adapter.messages_since("channel", t0).map(&:payload)
+  end
+
+  def test_forged_large_payload_notify_is_dropped_without_killing_the_listener
+    drop_messages_table
+
+    adapter = build_adapter(reliable_broadcasting: true)
+    pg_conn = ActiveRecord::Base.connection.raw_connection
+
+    subscribe_as_queue("channel", adapter) do |queue|
+      notify_channel = pg_conn.escape_identifier("channel")
+      forged_message = pg_conn.escape_string("#{ActionCable::SubscriptionAdapter::EnhancedPostgresql::LARGE_PAYLOAD_PREFIX}garbage")
+      pg_conn.exec("NOTIFY #{notify_channel}, '#{forged_message}'")
+
+      sleep 0.2
+      assert_empty queue
+
+      # The listener thread (abort_on_exception = true) must still be alive and working.
+      adapter.broadcast("channel", "still alive")
+      assert_equal "still alive", queue.pop
+    end
   end
 
   # Regression test: large payloads used to be stored SQL-escaped (quotes/backslashes doubled)

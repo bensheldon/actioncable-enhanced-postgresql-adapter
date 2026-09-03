@@ -345,38 +345,34 @@ end
 class ReliableBroadcastingHelperTest < ActionCable::TestCase
   StubController = Struct.new(:action_cable_since)
 
-  def test_meta_tag_renders_an_encrypted_token_of_the_controllers_captured_time
+  def test_since_param_renders_an_encrypted_token_of_the_controllers_captured_time
     controller_time = Time.now.utc
     encryptor = build_encryptor
     view = build_view(StubController.new(controller_time), encryptor)
 
-    tag = view.action_cable_enhanced_since_meta_tag
-
-    assert_match(/\A<meta name="action-cable-enhanced-since" content="[^"]+"\s*\/?>\z/, tag)
-    content = tag[/content="([^"]+)"/, 1]
+    token = view.action_cable_enhanced_since_param
 
     # Not the plain ISO 8601 string a client could read or forge - see the "Security" section
     # of the README.
-    refute_match(/\A\d{4}-\d{2}-\d{2}T/, content)
+    refute_match(/\A\d{4}-\d{2}-\d{2}T/, token)
 
-    parsed = ReliableBroadcasting.decrypt_since(content, encryptor)
+    parsed = ReliableBroadcasting.decrypt_since(token, encryptor)
 
     refute_nil parsed
     assert_in_delta controller_time.to_f, parsed.to_f, 0.000002
   end
 
-  def test_meta_tag_falls_back_to_now_without_a_controller_method
+  def test_since_param_falls_back_to_now_without_a_controller_method
     encryptor = build_encryptor
     view = ActionView::Base.empty
     view.singleton_class.include(ActionCable::SubscriptionAdapter::EnhancedPostgresql::ReliableBroadcasting::Helper)
     view.define_singleton_method(:action_cable_param_encryptor) { encryptor }
 
     before = Time.now.utc
-    tag = view.action_cable_enhanced_since_meta_tag
+    token = view.action_cable_enhanced_since_param
     after = Time.now.utc
 
-    content = tag[/content="([^"]+)"/, 1]
-    parsed = ReliableBroadcasting.decrypt_since(content, encryptor)
+    parsed = ReliableBroadcasting.decrypt_since(token, encryptor)
 
     refute_nil parsed
     assert_operator parsed, :>=, before

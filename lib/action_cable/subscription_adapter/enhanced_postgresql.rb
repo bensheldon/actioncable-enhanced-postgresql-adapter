@@ -9,6 +9,10 @@ module ActionCable
     class EnhancedPostgresql < PostgreSQL
       MAX_NOTIFY_SIZE = 7997 # documented as 8000 bytes, but there appears to be some overhead in transit
       LARGE_PAYLOAD_PREFIX = "__large_payload:"
+      # MessageEncryptor `purpose:` stored broadcast payloads (both large payloads and, with
+      # reliable_broadcasting on, every payload) are encrypted-and-signed under, so they sit
+      # encrypted at rest in #{BROADCASTS_TABLE} - see #encrypt_stored_payload/#decrypt_stored_payload.
+      BROADCAST_PAYLOAD_PURPOSE = "enhanced-broadcast"
       INSERTS_PER_DELETE = 100 # execute DELETE query every N inserts
       DEFAULT_MESSAGE_RETENTION = 120 # seconds
       DEFAULT_PRESENCE_TTL = 90 # seconds
@@ -71,7 +75,9 @@ module ActionCable
       #
       # id:         Integer primary key of the row in #{BROADCASTS_TABLE}
       # channel:    the stored (prefixed, un-hashed) channel name
-      # payload:    the raw (unescaped) broadcast payload, as passed to #broadcast
+      # payload:    the decrypted, raw (unescaped) broadcast payload, as passed to #broadcast -
+      #             stored, and read back, encrypted-and-signed at rest (see #payload_encryptor
+      #             and #decrypt_stored_payload)
       # created_at: Time (UTC) the row was inserted, as recorded by the database
       Message = Struct.new(:id, :channel, :payload, :created_at, keyword_init: true)
 
@@ -115,9 +121,10 @@ module ActionCable
           large = escaped_payload.bytesize > MAX_NOTIFY_SIZE
 
           if reliable_broadcasting? || large
-            # Store the RAW payload (fixes a latent bug: previously the escaped payload was
-            # stored, doubling quotes/backslashes for any payload containing them).
-            message_id = insert_broadcast(pg_conn, channel, payload)
+            # Store the payload encrypted-and-signed at rest (never the escaped form - that would
+            # double quotes/backslashes for any payload containing them), so a row read straight
+            # out of the database can't be read or forged - see #encrypt_stored_payload.
+            message_id = insert_broadcast(pg_conn, channel, encrypt_stored_payload(payload))
 
             pg_conn.exec_params(DELETE_STALE_MESSAGES_QUERY, [message_retention]) if message_id % INSERTS_PER_DELETE == 0
 
@@ -137,23 +144,36 @@ module ActionCable
       # (anything responding to #utc, e.g. a Time), ordered by id ASC. Returns [] if nothing is
       # stored, or if the broadcasts table doesn't exist (reliable_broadcasting was never enabled
       # and no large payload was ever broadcast).
+      #
+      # A row whose payload column fails to decrypt (e.g. it was written under a different
+      # payload_encryptor_secret, or the column somehow holds garbage) is skipped - logged as a
+      # warning rather than raised - since it can't be told apart from a forged row, and there is
+      # nothing sensible to replay it as.
       def messages_since(channel, since)
         channel = channel_with_prefix(channel)
 
         with_broadcast_connection do |pg_conn|
           result = pg_conn.exec_params(SELECT_MESSAGES_SINCE_QUERY, [channel, since.utc.iso8601(6)])
 
-          result.map do |row|
+          result.filter_map do |row|
             created_at = row["created_at"]
             # ActiveRecord-backed connections (the common case) apply a type map that already
             # casts timestamptz columns to Time; a plain PG::Connection (the `url:` option)
             # returns the raw text representation instead.
             created_at = Time.parse(created_at) unless created_at.is_a?(Time)
 
+            begin
+              payload = decrypt_stored_payload(row["payload"])
+            rescue ActiveSupport::MessageEncryptor::InvalidMessage, ActiveSupport::MessageVerifier::InvalidSignature
+              @server.logger.warn "#{self.class.name}#messages_since skipped an undecryptable stored payload " \
+                "(id=#{row["id"]}, channel=#{row["channel"]})"
+              next
+            end
+
             Message.new(
               id: row["id"].to_i,
               channel: row["channel"],
-              payload: row["payload"],
+              payload: payload,
               created_at: created_at
             )
           end
@@ -241,6 +261,20 @@ module ActionCable
 
       private
 
+      # Encrypts-and-signs +plaintext+ (a broadcast payload) for storage in #{BROADCASTS_TABLE},
+      # under BROADCAST_PAYLOAD_PURPOSE - see #payload_encryptor.
+      def encrypt_stored_payload(plaintext)
+        payload_encryptor.encrypt_and_sign(plaintext, purpose: BROADCAST_PAYLOAD_PURPOSE)
+      end
+
+      # Inverse of #encrypt_stored_payload. Raises ActiveSupport::MessageEncryptor::InvalidMessage
+      # or ActiveSupport::MessageVerifier::InvalidSignature if +ciphertext+ doesn't decrypt/verify
+      # (wrong secret, wrong purpose, or simply garbage) - callers decide how to handle that (see
+      # #messages_since and Listener#invoke_callback).
+      def decrypt_stored_payload(ciphertext)
+        payload_encryptor.decrypt_and_verify(ciphertext, purpose: BROADCAST_PAYLOAD_PURPOSE)
+      end
+
       def connection_pool
         @connection_pool ||= ConnectionPool.new(size: @connection_pool_size, timeout: 5) do
           PG::Connection.new(@url)
@@ -310,18 +344,36 @@ module ActionCable
       end
 
       class Listener < PostgreSQL::Listener
+        # Runs on the Listener thread, which has abort_on_exception = true (see
+        # PostgreSQL::Listener#initialize) - an unrescued exception here would take the whole
+        # process down. A forged/garbage `__large_payload:` NOTIFY (a spoofed id, an id whose row
+        # is gone, or a payload that fails to decrypt) is therefore never allowed to raise: it's
+        # logged as a warning and the message is dropped instead of delivered.
         def invoke_callback(callback, message)
           if message.start_with?(LARGE_PAYLOAD_PREFIX)
-            encrypted_payload_id = message.delete_prefix(LARGE_PAYLOAD_PREFIX)
-            payload_id = @adapter.payload_encryptor.decrypt_and_verify(encrypted_payload_id)
-
-            @adapter.with_broadcast_connection do |pg_conn|
-              result = pg_conn.exec_params(SELECT_LARGE_PAYLOAD_QUERY, [payload_id])
-              message = result.first.fetch("payload")
-            end
+            message = fetch_large_payload(message)
+            return if message.nil?
           end
 
           @event_loop.post { super }
+        end
+
+        private
+
+        def fetch_large_payload(message)
+          encrypted_payload_id = message.delete_prefix(LARGE_PAYLOAD_PREFIX)
+          payload_id = @adapter.payload_encryptor.decrypt_and_verify(encrypted_payload_id)
+
+          row = @adapter.with_broadcast_connection do |pg_conn|
+            pg_conn.exec_params(SELECT_LARGE_PAYLOAD_QUERY, [payload_id]).first
+          end
+          return nil if row.nil?
+
+          @adapter.send(:decrypt_stored_payload, row.fetch("payload"))
+        rescue ActiveSupport::MessageEncryptor::InvalidMessage, ActiveSupport::MessageVerifier::InvalidSignature
+          @adapter.logger.warn "#{self.class.name} dropped a `#{LARGE_PAYLOAD_PREFIX}` notification with an " \
+            "undecryptable id or payload"
+          nil
         end
       end
     end

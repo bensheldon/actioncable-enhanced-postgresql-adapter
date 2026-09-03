@@ -13,14 +13,13 @@ require "time"
 # Rails constants (ActionController::Base, ActionView helpers) once actually included into them.
 class ActionCable::SubscriptionAdapter::EnhancedPostgresql
   module ReliableBroadcasting
-    # The primary wire name for the channel param / meta tag. Also used as the MessageEncryptor
-    # `purpose:` the token is confined to.
+    # The primary wire name for the channel param. Also used as the MessageEncryptor `purpose:`
+    # the token is confined to.
     SINCE_PARAM = "enhanced-since"
-    # turbo-rails forwards a `data-enhanced-since` attribute (see the README's Option B
+    # turbo-rails forwards a `data-enhanced-since` attribute (see the README's Hotwire
     # walkthrough) as the channel param `enhanced_since` (it snake_cases dasherized data
     # attribute names), so that spelling has to be accepted too.
     SINCE_PARAM_ALTERNATIVES = ["enhanced_since"].freeze
-    META_TAG_NAME = "action-cable-enhanced-since"
 
     class << self
       # Time -> "2026-09-02T18:55:12.123456Z" (UTC, microsecond precision).
@@ -43,7 +42,7 @@ class ActionCable::SubscriptionAdapter::EnhancedPostgresql
         nil
       end
 
-      # Time -> an encrypted-and-signed token safe to embed in HTML (a meta tag or a data-*
+      # Time -> an encrypted-and-signed token safe to embed in HTML (typically a data-*
       # attribute). +encryptor+ is an ActiveSupport::MessageEncryptor - in practice the adapter's
       # own #payload_encryptor, so a client can't forge or read the timestamp it sends back.
       def encrypt_since(time, encryptor)
