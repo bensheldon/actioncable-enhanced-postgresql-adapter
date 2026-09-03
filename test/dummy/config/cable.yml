@@ -1,3 +1,5 @@
 test:
   adapter: enhanced_postgresql
   reliable_broadcasting: true
+  presence_ttl: 2
+  presence_heartbeat_interval: 0.5

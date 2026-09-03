@@ -103,4 +103,48 @@ class HotwireReliableBroadcastingTest < ActionDispatch::SystemTestCase
 
     assert_no_selector "#message_during_render"
   end
+
+  # Polls +block+ (expected to return a truthy/falsy value) until it's truthy or +timeout+
+  # elapses - used below because presence registration, heartbeats, and removal on unsubscribe
+  # are all dispatched to the worker pool / driven by a background timer, not synchronous with
+  # `visit`.
+  def assert_eventually(timeout: 10)
+    deadline = Time.now + timeout
+    loop do
+      return if yield
+      raise "Condition not met within #{timeout}s" if Time.now > deadline
+
+      sleep 0.2
+    end
+  end
+
+  def test_presence_lists_who_is_currently_on_the_stream
+    room_id = SecureRandom.hex(8)
+    room = "room-#{room_id}"
+
+    visit "/rooms/#{room_id}?name=alice"
+
+    assert_selector "turbo-cable-stream-source[data-enhanced-presence]", visible: :all
+
+    # The value is an encrypted-and-signed token, not the plain presence string - a client must
+    # not be able to read or forge it (same requirement as `data-enhanced-since`).
+    token = find("turbo-cable-stream-source", visible: :all)["data-enhanced-presence"]
+    refute_equal "alice", token
+
+    assert_eventually { ActionCable.server.pubsub.presences(room) == ["alice"] }
+
+    using_session(:bob) do
+      visit "/rooms/#{room_id}?name=bob"
+    end
+
+    assert_eventually { ActionCable.server.pubsub.presences(room) == ["alice", "bob"] }
+
+    # Navigating away closes bob's WebSocket connection, unsubscribing the channel - alice
+    # should be the only one left.
+    using_session(:bob) do
+      visit "about:blank"
+    end
+
+    assert_eventually { ActionCable.server.pubsub.presences(room) == ["alice"] }
+  end
 end

@@ -11,6 +11,8 @@ module ActionCable
       LARGE_PAYLOAD_PREFIX = "__large_payload:"
       INSERTS_PER_DELETE = 100 # execute DELETE query every N inserts
       DEFAULT_MESSAGE_RETENTION = 120 # seconds
+      DEFAULT_PRESENCE_TTL = 90 # seconds
+      DEFAULT_PRESENCE_HEARTBEAT_INTERVAL = 30 # seconds
 
       BROADCASTS_TABLE = "action_cable_enhanced_broadcasts"
       LEGACY_LARGE_PAYLOADS_TABLE = "action_cable_large_payloads" # only used for schema-dumper ignore + docs
@@ -37,6 +39,34 @@ module ActionCable
       SELECT_MESSAGES_SINCE_QUERY = "SELECT id, channel, payload, created_at FROM #{BROADCASTS_TABLE} WHERE channel = $1 AND created_at >= $2::timestamptz ORDER BY id ASC"
       DELETE_STALE_MESSAGES_QUERY = "DELETE FROM #{BROADCASTS_TABLE} WHERE created_at < CURRENT_TIMESTAMP - ($1::int * INTERVAL '1 second')"
 
+      PRESENCES_TABLE = "action_cable_enhanced_presences"
+
+      CREATE_PRESENCES_TABLE_QUERY = <<~SQL
+        CREATE UNLOGGED TABLE IF NOT EXISTS #{PRESENCES_TABLE} (
+          channel TEXT NOT NULL,
+          presence TEXT NOT NULL,
+          subscription_key TEXT NOT NULL,
+          last_seen_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (channel, presence, subscription_key)
+        )
+      SQL
+      CREATE_PRESENCES_LAST_SEEN_INDEX_QUERY = <<~SQL
+        CREATE INDEX IF NOT EXISTS index_action_cable_enhanced_presences_on_last_seen_at
+        ON #{PRESENCES_TABLE} (last_seen_at)
+      SQL
+      TOUCH_PRESENCE_QUERY = <<~SQL
+        INSERT INTO #{PRESENCES_TABLE} (channel, presence, subscription_key, last_seen_at)
+        VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+        ON CONFLICT (channel, presence, subscription_key) DO UPDATE SET last_seen_at = CURRENT_TIMESTAMP
+      SQL
+      REMOVE_PRESENCE_QUERY = "DELETE FROM #{PRESENCES_TABLE} WHERE channel = $1 AND presence = $2 AND subscription_key = $3"
+      SELECT_PRESENCES_QUERY = <<~SQL
+        SELECT DISTINCT presence FROM #{PRESENCES_TABLE}
+        WHERE channel = $1 AND last_seen_at >= CURRENT_TIMESTAMP - ($2::int * INTERVAL '1 second')
+        ORDER BY presence
+      SQL
+      DELETE_STALE_PRESENCES_QUERY = "DELETE FROM #{PRESENCES_TABLE} WHERE last_seen_at < CURRENT_TIMESTAMP - ($1::int * INTERVAL '1 second')"
+
       # A single stored broadcast payload.
       #
       # id:         Integer primary key of the row in #{BROADCASTS_TABLE}
@@ -52,7 +82,11 @@ module ActionCable
         @connection_pool_size = @server.config.cable[:connection_pool_size] || ENV["RAILS_MAX_THREADS"] || 5
         @reliable_broadcasting = !!@server.config.cable[:reliable_broadcasting]
         @message_retention = Integer(@server.config.cable[:message_retention] || DEFAULT_MESSAGE_RETENTION)
+        @presence_ttl = Integer(@server.config.cable[:presence_ttl] || DEFAULT_PRESENCE_TTL)
+        @presence_heartbeat_interval = Float(@server.config.cable[:presence_heartbeat_interval] || DEFAULT_PRESENCE_HEARTBEAT_INTERVAL)
         @broadcasts_table_ensured = false
+        @presences_table_ensured = false
+        @presence_touch_count = 0
       end
 
       # Whether every broadcast payload (not only ones exceeding the NOTIFY size limit) is
@@ -63,6 +97,14 @@ module ActionCable
 
       # Number of seconds stored messages are retained for before being eligible for deletion.
       attr_reader :message_retention
+
+      # Number of seconds a presence stays listed (see #presences) without a heartbeat
+      # (#touch_presence) before it's considered gone.
+      attr_reader :presence_ttl
+
+      # Number of seconds between heartbeats a Presence::Channel subscription sends to keep its
+      # presence alive. May be a Float.
+      attr_reader :presence_heartbeat_interval
 
       def broadcast(channel, payload)
         channel = channel_with_prefix(channel)
@@ -115,6 +157,51 @@ module ActionCable
               created_at: created_at
             )
           end
+        end
+      rescue PG::UndefinedTable
+        []
+      end
+
+      # Records (or refreshes) that +presence+ is present on +channel+ (the broadcasting name as
+      # passed to #broadcast; the channel_prefix, if any, is applied internally, and the value is
+      # stored un-hashed) for the given +subscription_key+ - a value unique per subscription
+      # (typically Presence::Channel's SecureRandom-generated key) so that the same +presence+
+      # value from two different subscriptions is tracked, and expires, independently, while
+      # still only being listed once by #presences. Periodically (every INSERTS_PER_DELETE calls)
+      # also deletes presences that haven't been touched within #presence_ttl seconds.
+      def touch_presence(channel, presence, subscription_key)
+        channel = channel_with_prefix(channel)
+
+        with_broadcast_connection do |pg_conn|
+          ensure_presences_table(pg_conn)
+          exec_touch_presence(pg_conn, channel, presence, subscription_key)
+        end
+      end
+
+      # Removes the presence recorded by #touch_presence for this exact +channel+/+presence+/
+      # +subscription_key+ triple. A no-op (not an error) if the presences table doesn't exist
+      # yet or the row is already gone.
+      def remove_presence(channel, presence, subscription_key)
+        channel = channel_with_prefix(channel)
+
+        with_broadcast_connection do |pg_conn|
+          pg_conn.exec_params(REMOVE_PRESENCE_QUERY, [channel, presence, subscription_key])
+        end
+      rescue PG::UndefinedTable
+        nil
+      end
+
+      # Returns the sorted, de-duplicated list (Array<String>) of presence values currently
+      # recorded for +channel+ (the broadcasting name as passed to #broadcast; channel_prefix
+      # applied internally) whose most recent #touch_presence happened within #presence_ttl
+      # seconds. Returns [] if nothing is recorded, or if the presences table doesn't exist
+      # (no presence was ever touched).
+      def presences(channel)
+        channel = channel_with_prefix(channel)
+
+        with_broadcast_connection do |pg_conn|
+          result = pg_conn.exec_params(SELECT_PRESENCES_QUERY, [channel, presence_ttl])
+          result.map { |row| row["presence"] }
         end
       rescue PG::UndefinedTable
         []
@@ -191,6 +278,32 @@ module ActionCable
         retry
       end
 
+      # Ensures #{PRESENCES_TABLE} (and its index) exist. Runs once per adapter instance, mirrors
+      # #ensure_broadcasts_table above.
+      def ensure_presences_table(pg_conn)
+        return if @presences_table_ensured
+
+        create_presences_table(pg_conn)
+        @presences_table_ensured = true
+      end
+
+      def create_presences_table(pg_conn)
+        pg_conn.exec(CREATE_PRESENCES_TABLE_QUERY)
+        pg_conn.exec(CREATE_PRESENCES_LAST_SEEN_INDEX_QUERY)
+      rescue PG::UniqueViolation, PG::DuplicateTable
+        # Concurrent creation race, table (or its index) already exists.
+      end
+
+      def exec_touch_presence(pg_conn, channel, presence, subscription_key)
+        pg_conn.exec_params(TOUCH_PRESENCE_QUERY, [channel, presence, subscription_key])
+        @presence_touch_count += 1
+        pg_conn.exec_params(DELETE_STALE_PRESENCES_QUERY, [presence_ttl]) if (@presence_touch_count % INSERTS_PER_DELETE).zero?
+      rescue PG::UndefinedTable
+        # The table was dropped at runtime - create it and try again.
+        create_presences_table(pg_conn)
+        retry
+      end
+
       # Override needed to ensure we reference our local Listener class
       def listener
         @listener || @server.mutex.synchronize { @listener ||= Listener.new(self, @server.event_loop) }
@@ -216,3 +329,4 @@ module ActionCable
 end
 
 require_relative "enhanced_postgresql/reliable_broadcasting"
+require_relative "enhanced_postgresql/presence"

@@ -1,7 +1,10 @@
 <h1>Room</h1>
 
 <% if @reliable %>
-  <%= turbo_stream_from @room, data: { enhanced_since: action_cable_enhanced_since_param } %>
+  <%= turbo_stream_from @room, data: {
+    enhanced_since: action_cable_enhanced_since_param,
+    enhanced_presence: (action_cable_enhanced_presence_param(params[:name]) if params[:name].present?)
+  }.compact %>
 <% else %>
   <%= turbo_stream_from @room %>
 <% end %>

@@ -5,6 +5,7 @@ class ActionCable::SubscriptionAdapter::EnhancedPostgresql
         adapter = ActionCable::SubscriptionAdapter::EnhancedPostgresql
         ActiveRecord::SchemaDumper.ignore_tables << adapter::BROADCASTS_TABLE
         ActiveRecord::SchemaDumper.ignore_tables << adapter::LEGACY_LARGE_PAYLOADS_TABLE
+        ActiveRecord::SchemaDumper.ignore_tables << adapter::PRESENCES_TABLE
       end
 
       ActiveSupport.on_load(:action_controller_base) do

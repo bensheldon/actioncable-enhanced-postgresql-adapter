@@ -21,6 +21,15 @@ class ActionCable::SubscriptionAdapter::EnhancedPostgresql
         tag("meta", name: ReliableBroadcasting::META_TAG_NAME, content: action_cable_enhanced_since_param)
       end
 
+      # An encrypted-and-signed token of `value.to_s`, suitable for a channel param or a data-*
+      # attribute (typically `turbo_stream_from @room, data: { enhanced_presence:
+      # action_cable_enhanced_presence_param(current_user.name) }`), for use with
+      # Presence::Channel. A client can see the token but can't read or forge its content - see
+      # #action_cable_param_encryptor and Presence.encrypt.
+      def action_cable_enhanced_presence_param(value)
+        Presence.encrypt(value, action_cable_param_encryptor)
+      end
+
       private
 
       # The ActiveSupport::MessageEncryptor used to encrypt values embedded in the page (the

@@ -15,6 +15,7 @@ require "timeout"
 require "action_cable/subscription_adapter/enhanced_postgresql"
 
 ReliableBroadcasting = ActionCable::SubscriptionAdapter::EnhancedPostgresql::ReliableBroadcasting
+Presence = ActionCable::SubscriptionAdapter::EnhancedPostgresql::Presence
 
 # A minimal stand-in for ActionCable::Connection::Base, exposing just what
 # ActionCable::Channel::Base / Streams / our concern touch: #server (for its #pubsub, #worker_pool
@@ -65,6 +66,15 @@ end
 
 class ReplayTestChannel < ActionCable::Channel::Base
   include ActionCable::SubscriptionAdapter::EnhancedPostgresql::ReliableBroadcasting::Channel
+
+  def subscribed
+    stream_from params[:room]
+  end
+end
+
+class PresenceTestChannel < ActionCable::Channel::Base
+  include ActionCable::SubscriptionAdapter::EnhancedPostgresql::ReliableBroadcasting::Channel
+  include ActionCable::SubscriptionAdapter::EnhancedPostgresql::Presence::Channel
 
   def subscribed
     stream_from params[:room]
@@ -383,6 +393,19 @@ class ReliableBroadcastingHelperTest < ActionCable::TestCase
     assert_match(/payload_encryptor|enhanced_postgresql/, error.message)
   end
 
+  def test_enhanced_presence_param_renders_an_encrypted_token_of_the_given_value
+    encryptor = build_encryptor
+    view = build_view(StubController.new(Time.now.utc), encryptor)
+
+    token = view.action_cable_enhanced_presence_param("alice")
+
+    # Not the plain value a client could read or forge - see the "Security" section of the
+    # README.
+    refute_equal "alice", token
+
+    assert_equal "alice", Presence.decrypt(token, encryptor)
+  end
+
   private
 
   def build_encryptor
@@ -463,6 +486,77 @@ class ReliableBroadcastingTimestampTest < ActionCable::TestCase
   end
 end
 
+class PresenceModuleTest < ActionCable::TestCase
+  def test_encrypt_and_decrypt_round_trip
+    encryptor = build_encryptor
+
+    token = Presence.encrypt("alice", encryptor)
+
+    refute_equal "alice", token
+    assert_equal "alice", Presence.decrypt(token, encryptor)
+  end
+
+  def test_encrypt_stringifies_the_value
+    encryptor = build_encryptor
+
+    token = Presence.encrypt(:alice, encryptor)
+
+    assert_equal "alice", Presence.decrypt(token, encryptor)
+  end
+
+  def test_decrypt_returns_nil_for_nil_blank_or_garbage_tokens
+    encryptor = build_encryptor
+
+    assert_nil Presence.decrypt(nil, encryptor)
+    assert_nil Presence.decrypt("", encryptor)
+    assert_nil Presence.decrypt("garbage", encryptor)
+  end
+
+  def test_decrypt_returns_nil_for_a_blank_decrypted_value
+    encryptor = build_encryptor
+
+    assert_nil Presence.decrypt(Presence.encrypt("", encryptor), encryptor)
+    assert_nil Presence.decrypt(Presence.encrypt("   ", encryptor), encryptor)
+  end
+
+  def test_decrypt_returns_nil_for_a_value_over_max_length
+    encryptor = build_encryptor
+    too_long = "a" * (Presence::MAX_LENGTH + 1)
+
+    assert_nil Presence.decrypt(Presence.encrypt(too_long, encryptor), encryptor)
+    assert_equal "a" * Presence::MAX_LENGTH, Presence.decrypt(Presence.encrypt("a" * Presence::MAX_LENGTH, encryptor), encryptor)
+  end
+
+  def test_decrypt_returns_nil_for_a_token_encrypted_with_a_different_secret
+    token = Presence.encrypt("alice", build_encryptor)
+
+    assert_nil Presence.decrypt(token, build_encryptor)
+  end
+
+  # Purpose-scoping means a `since` token must never be usable as a presence token, and vice
+  # versa, even when both were produced with the very same encryptor/secret.
+  def test_decrypt_returns_nil_for_a_since_token
+    encryptor = build_encryptor
+    since_token = ReliableBroadcasting.encrypt_since(Time.now.utc, encryptor)
+
+    assert_nil Presence.decrypt(since_token, encryptor)
+  end
+
+  def test_param_token_accepts_the_primary_name_the_alternative_name_and_symbol_keys
+    assert_equal "x", Presence.param_token({"enhanced-presence" => "x"})
+    assert_equal "x", Presence.param_token({enhanced_presence: "x"})
+    assert_equal "x", Presence.param_token({"enhanced_presence" => "x"})
+    assert_nil Presence.param_token({"presence" => "x"})
+    assert_nil Presence.param_token({})
+  end
+
+  private
+
+  def build_encryptor
+    ActiveSupport::MessageEncryptor.new(SecureRandom.random_bytes(32))
+  end
+end
+
 # A Railtie smoke test: verify it loads (without actionpack/actionview or a full app boot required
 # for *this* part) and registers its initializer, without actually booting a Rails::Application
 # (which run_load_hooks(:action_controller_base) etc. would require).
@@ -475,5 +569,247 @@ class ReliableBroadcastingRailtieTest < ActionCable::TestCase
     railtie = ActionCable::SubscriptionAdapter::EnhancedPostgresql::Railtie
     assert_operator railtie, :<, Rails::Railtie
     assert_includes railtie.initializers.map(&:name), "action_cable.enhanced_postgresql_adapter"
+  end
+end
+
+# Presence::Channel: touches (and heartbeats) presence for every stream a subscription is
+# streaming from, and removes it again on unsubscribe. Composes with ReliableBroadcasting::Channel
+# (see PresenceTestChannel above) - both override transmit_subscription_confirmation and
+# stop_stream_from/stop_all_streams, each calling super.
+class PresenceChannelTest < ActionCable::TestCase
+  CONFIRMATION_TYPE = ActionCable::INTERNAL[:message_types][:confirmation]
+
+  def setup
+    database_config = { "adapter" => "postgresql", "database" => "actioncable_enhanced_postgresql_test" }
+
+    # Create the database unless it already exists
+    begin
+      ActiveRecord::Base.establish_connection database_config.merge("database" => "postgres")
+      ActiveRecord::Base.connection.create_database database_config["database"], encoding: "utf8"
+    rescue ActiveRecord::DatabaseAlreadyExists
+    end
+
+    # Connect to the database
+    ActiveRecord::Base.establish_connection database_config
+    ActiveRecord::Base.connection.connect!
+
+    super
+  end
+
+  def teardown
+    super
+
+    ActiveRecord::Base.connection_handler.clear_all_connections!
+  end
+
+  def cable_config
+    { adapter: "enhanced_postgresql", payload_encryptor_secret: SecureRandom.hex(16) }
+  end
+
+  def test_presence_is_listed_after_subscription_confirms
+    server = build_server
+    room = unique_room
+
+    connection, channel = build_channel(server, room: room, presence: "alice")
+    channel.subscribe_to_channel
+
+    assert_confirmation(connection)
+    assert wait_for_presences(server, room, ["alice"])
+  end
+
+  def test_two_connections_with_different_presences_are_both_listed
+    server = build_server
+    room = unique_room
+
+    connection1, channel1 = build_channel(server, room: room, presence: "alice")
+    channel1.subscribe_to_channel
+    assert_confirmation(connection1)
+
+    connection2, channel2 = build_channel(server, room: room, presence: "bob")
+    channel2.subscribe_to_channel
+    assert_confirmation(connection2)
+
+    assert wait_for_presences(server, room, ["alice", "bob"])
+  ensure
+    channel1&.unsubscribe_from_channel
+    channel2&.unsubscribe_from_channel
+  end
+
+  def test_same_presence_from_two_connections_is_listed_once_and_survives_one_unsubscribing
+    server = build_server
+    room = unique_room
+
+    connection1, channel1 = build_channel(server, room: room, presence: "alice")
+    channel1.subscribe_to_channel
+    assert_confirmation(connection1)
+
+    connection2, channel2 = build_channel(server, room: room, presence: "alice")
+    channel2.subscribe_to_channel
+    assert_confirmation(connection2)
+
+    assert wait_for_presences(server, room, ["alice"])
+
+    channel1.unsubscribe_from_channel
+    # The second connection's "alice" is a separate, independently tracked row (distinct
+    # subscription_key) - it's still there.
+    assert wait_for_presences(server, room, ["alice"])
+
+    channel2.unsubscribe_from_channel
+    assert wait_for_presences(server, room, [])
+  end
+
+  def test_presence_is_removed_on_unsubscribe_from_channel
+    server = build_server
+    room = unique_room
+
+    connection, channel = build_channel(server, room: room, presence: "alice")
+    channel.subscribe_to_channel
+    assert_confirmation(connection)
+    assert wait_for_presences(server, room, ["alice"])
+
+    channel.unsubscribe_from_channel
+    assert wait_for_presences(server, room, [])
+  end
+
+  def test_heartbeat_keeps_presence_alive_past_the_ttl
+    server = build_server(presence_ttl: 2, presence_heartbeat_interval: 0.5)
+    room = unique_room
+
+    connection, channel = build_channel(server, room: room, presence: "alice")
+    channel.subscribe_to_channel
+    assert_confirmation(connection)
+    assert wait_for_presences(server, room, ["alice"])
+
+    sleep 3
+
+    assert_equal ["alice"], server.pubsub.presences(room)
+  ensure
+    channel&.unsubscribe_from_channel
+  end
+
+  # Simulates a crashed process: the heartbeat timer stops firing (as it would if the connection
+  # simply vanished without a clean unsubscribe), but nothing removes the row. It should still
+  # expire on its own once presence_ttl elapses without a heartbeat.
+  def test_presence_expires_after_ttl_once_the_timer_stops_without_a_clean_unsubscribe
+    server = build_server(presence_ttl: 2, presence_heartbeat_interval: 0.5)
+    room = unique_room
+
+    connection, channel = build_channel(server, room: room, presence: "alice")
+    channel.subscribe_to_channel
+    assert_confirmation(connection)
+    assert wait_for_presences(server, room, ["alice"])
+
+    timer = channel.instance_variable_get(:@enhanced_presence_timer)
+    refute_nil timer
+    timer.shutdown
+
+    sleep 3
+
+    assert_equal [], server.pubsub.presences(room)
+  end
+
+  def test_garbage_presence_token_stores_nothing_and_warns
+    server = build_server
+    room = unique_room
+
+    connection, channel = build_channel(server, room: room, presence_token: "garbage-not-a-token")
+    channel.subscribe_to_channel
+    assert_confirmation(connection)
+
+    sleep 0.3
+    assert_equal [], server.pubsub.presences(room)
+    assert_match(/invalid or forged/, connection.log_io.string)
+  end
+
+  # A `since` token must not be accepted as a presence token - the two are confined to different
+  # MessageEncryptor purposes (see Presence::PURPOSE vs ReliableBroadcasting::SINCE_PARAM).
+  def test_since_token_is_rejected_as_a_presence_token
+    server = build_server
+    room = unique_room
+    since_token = ReliableBroadcasting.encrypt_since(Time.now.utc, server.pubsub.payload_encryptor)
+
+    connection, channel = build_channel(server, room: room, presence_token: since_token)
+    channel.subscribe_to_channel
+    assert_confirmation(connection)
+
+    sleep 0.3
+    assert_equal [], server.pubsub.presences(room)
+    assert_match(/invalid or forged/, connection.log_io.string)
+  end
+
+  def test_no_presence_param_stores_nothing_and_starts_no_timer
+    server = build_server
+    room = unique_room
+
+    connection, channel = build_channel(server, room: room)
+    channel.subscribe_to_channel
+    assert_confirmation(connection)
+
+    sleep 0.3
+    assert_equal [], server.pubsub.presences(room)
+    assert_nil channel.instance_variable_get(:@enhanced_presence_timer)
+  end
+
+  # Registration is dispatched to the worker pool after the confirmation is sent. If the client
+  # disconnects in between, the unsubscribe cleanup runs first and the late registration job must
+  # not leave an orphaned heartbeat timer (or rows) behind.
+  def test_registration_after_unsubscribe_starts_no_timer_and_stores_nothing
+    server = build_server
+    room = unique_room
+
+    _connection, channel = build_channel(server, room: room, presence: "alice")
+    channel.send(:stream_from, room)
+
+    channel.send(:stop_enhanced_presence)   # what after_unsubscribe runs
+    channel.send(:start_enhanced_presence)  # the late worker pool job
+
+    sleep 0.3
+    assert_nil channel.instance_variable_get(:@enhanced_presence_timer)
+    assert_equal [], server.pubsub.presences(room)
+  end
+
+  private
+
+  def unique_room
+    "presence-channel-test-#{SecureRandom.hex(8)}"
+  end
+
+  def build_server(overrides = {})
+    server = ActionCable::Server::Base.new(config: ActionCable::Server::Configuration.new)
+    server.config.cable = cable_config.merge(overrides).with_indifferent_access
+    server.config.logger = Logger.new(StringIO.new).tap { |l| l.level = Logger::UNKNOWN }
+    server
+  end
+
+  def build_channel(server, room:, presence: :none, presence_token: nil)
+    connection = FakeConnection.new(server)
+    params = {"room" => room}
+    if presence_token
+      params[Presence::PARAM] = presence_token
+    elsif presence != :none
+      params[Presence::PARAM] = Presence.encrypt(presence, server.pubsub.payload_encryptor)
+    end
+    channel = PresenceTestChannel.new(connection, '{"channel":"PresenceTestChannel"}', params.with_indifferent_access)
+    [connection, channel]
+  end
+
+  def assert_confirmation(connection)
+    transmission = connection.pop_transmission
+    assert_equal CONFIRMATION_TYPE, transmission[:type]
+  end
+
+  # Polls server.pubsub.presences(room) until it matches +expected+ (order-independent) or
+  # +timeout+ elapses, returning whether it matched - presence registration and heartbeats are
+  # dispatched to the worker pool, so they don't happen synchronously with subscribe_to_channel /
+  # unsubscribe_from_channel.
+  def wait_for_presences(server, room, expected, timeout: 3)
+    deadline = Time.now + timeout
+    loop do
+      actual = server.pubsub.presences(room)
+      return true if actual.sort == expected.sort
+      return false if Time.now > deadline
+
+      sleep 0.05
+    end
   end
 end

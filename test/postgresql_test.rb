@@ -353,3 +353,201 @@ class ReliablePostgresqlAdapterTest < PostgresqlAdapterTest
     super.merge(reliable_broadcasting: true)
   end
 end
+
+# Presence API (#touch_presence, #remove_presence, #presences) exposed directly on the adapter -
+# see PresenceChannelTest in reliable_broadcasting_test.rb for the Channel concern built on top
+# of this.
+class PresenceAdapterTest < ActionCable::TestCase
+  def setup
+    database_config = { "adapter" => "postgresql", "database" => "actioncable_enhanced_postgresql_test" }
+
+    # Create the database unless it already exists
+    begin
+      ActiveRecord::Base.establish_connection database_config.merge("database" => "postgres")
+      ActiveRecord::Base.connection.create_database database_config["database"], encoding: "utf8"
+    rescue ActiveRecord::DatabaseAlreadyExists
+    end
+
+    # Connect to the database
+    ActiveRecord::Base.establish_connection database_config
+    ActiveRecord::Base.connection.connect!
+
+    super
+  end
+
+  def teardown
+    super
+
+    ActiveRecord::Base.connection_handler.clear_all_connections!
+  end
+
+  def cable_config
+    { adapter: "enhanced_postgresql", payload_encryptor_secret: SecureRandom.hex(16) }
+  end
+
+  def test_touch_then_list_then_remove_presence
+    drop_presences_table
+
+    adapter = build_adapter
+    room = unique_room
+
+    adapter.touch_presence(room, "alice", "sub-1")
+    assert_equal ["alice"], adapter.presences(room)
+
+    adapter.remove_presence(room, "alice", "sub-1")
+    assert_equal [], adapter.presences(room)
+  end
+
+  def test_same_presence_from_two_subscription_keys_is_listed_once
+    drop_presences_table
+
+    adapter = build_adapter
+    room = unique_room
+
+    adapter.touch_presence(room, "alice", "sub-1")
+    adapter.touch_presence(room, "alice", "sub-2")
+
+    assert_equal ["alice"], adapter.presences(room)
+
+    # Removing one subscription's presence leaves the other's intact.
+    adapter.remove_presence(room, "alice", "sub-1")
+    assert_equal ["alice"], adapter.presences(room)
+
+    adapter.remove_presence(room, "alice", "sub-2")
+    assert_equal [], adapter.presences(room)
+  end
+
+  def test_presences_are_sorted_and_deduplicated_across_subscription_keys
+    drop_presences_table
+
+    adapter = build_adapter
+    room = unique_room
+
+    adapter.touch_presence(room, "bob", "sub-1")
+    adapter.touch_presence(room, "alice", "sub-2")
+    adapter.touch_presence(room, "alice", "sub-3")
+
+    assert_equal ["alice", "bob"], adapter.presences(room)
+  end
+
+  def test_presences_are_isolated_by_channel
+    drop_presences_table
+
+    adapter = build_adapter
+
+    adapter.touch_presence("room a", "alice", "sub-1")
+    adapter.touch_presence("room b", "bob", "sub-2")
+
+    assert_equal ["alice"], adapter.presences("room a")
+    assert_equal ["bob"], adapter.presences("room b")
+  end
+
+  def test_presences_honours_channel_prefix
+    drop_presences_table
+
+    adapter1 = build_adapter(channel_prefix: "foo")
+    adapter2 = build_adapter(channel_prefix: "bar")
+    room = unique_room
+
+    adapter1.touch_presence(room, "alice", "sub-1")
+    adapter2.touch_presence(room, "bob", "sub-2")
+
+    assert_equal ["alice"], adapter1.presences(room)
+    assert_equal ["bob"], adapter2.presences(room)
+  end
+
+  def test_presence_expires_after_ttl_without_a_heartbeat
+    drop_presences_table
+
+    adapter = build_adapter(presence_ttl: 60)
+    room = unique_room
+    pg_conn = ActiveRecord::Base.connection.raw_connection
+
+    adapter.touch_presence(room, "alice", "sub-1") # ensures the table exists
+
+    presences_table = ActionCable::SubscriptionAdapter::EnhancedPostgresql::PRESENCES_TABLE
+    pg_conn.exec_params(
+      "UPDATE #{presences_table} SET last_seen_at = NOW() - INTERVAL '10 minutes' WHERE channel = $1 AND presence = $2",
+      [adapter.send(:channel_with_prefix, room), "alice"]
+    )
+
+    assert_equal [], adapter.presences(room)
+  ensure
+    pg_conn&.close
+  end
+
+  def test_the_100th_touch_deletes_stale_presences
+    drop_presences_table
+
+    inserts_per_delete = ActionCable::SubscriptionAdapter::EnhancedPostgresql::INSERTS_PER_DELETE
+    presences_table = ActionCable::SubscriptionAdapter::EnhancedPostgresql::PRESENCES_TABLE
+    adapter = build_adapter(presence_ttl: 60)
+    room = unique_room
+    pg_conn = ActiveRecord::Base.connection.raw_connection
+
+    adapter.touch_presence(room, "stale", "sub-stale") # ensures the table exists, count = 1
+    pg_conn.exec_params(
+      "UPDATE #{presences_table} SET last_seen_at = NOW() - INTERVAL '10 minutes' WHERE channel = $1 AND presence = $2",
+      [adapter.send(:channel_with_prefix, room), "stale"]
+    )
+
+    # Bring the touch counter up to one shy of the next multiple of INSERTS_PER_DELETE.
+    (inserts_per_delete - 2).times { |i| adapter.touch_presence(room, "filler-#{i}", "sub-filler-#{i}") }
+
+    assert_equal inserts_per_delete - 1, adapter.instance_variable_get(:@presence_touch_count)
+    assert_equal 1, pg_conn.exec_params("SELECT COUNT(*) FROM #{presences_table} WHERE presence = 'stale'").first.fetch("count").to_i
+
+    # This 100th touch triggers the periodic DELETE, reaping the stale row above (it doesn't
+    # touch itself, so it isn't reaped by its own call).
+    adapter.touch_presence(room, "trigger", "sub-trigger")
+
+    assert_equal 0, pg_conn.exec_params("SELECT COUNT(*) FROM #{presences_table} WHERE presence = 'stale'").first.fetch("count").to_i
+  ensure
+    pg_conn&.close
+  end
+
+  def test_presences_returns_empty_array_when_table_missing
+    drop_presences_table
+
+    adapter = build_adapter
+
+    assert_equal [], adapter.presences(unique_room)
+  end
+
+  def test_remove_presence_is_a_no_op_when_table_missing
+    drop_presences_table
+
+    adapter = build_adapter
+
+    assert_nil adapter.remove_presence(unique_room, "alice", "sub-1")
+  end
+
+  def test_presence_ttl_and_presence_heartbeat_interval_readers
+    default_adapter = build_adapter
+    assert_equal 90, default_adapter.presence_ttl
+    assert_equal 30, default_adapter.presence_heartbeat_interval
+
+    configured_adapter = build_adapter(presence_ttl: 2, presence_heartbeat_interval: 0.5)
+    assert_equal 2, configured_adapter.presence_ttl
+    assert_in_delta 0.5, configured_adapter.presence_heartbeat_interval, 0.0001
+  end
+
+  private
+
+  def unique_room
+    "presence-test-#{SecureRandom.hex(8)}"
+  end
+
+  def build_adapter(config_overrides = {})
+    server = ActionCable::Server::Base.new(config: ActionCable::Server::Configuration.new)
+    server.config.cable = cable_config.merge(config_overrides).with_indifferent_access
+    server.config.logger = Logger.new(StringIO.new).tap { |l| l.level = Logger::UNKNOWN }
+    server.config.pubsub_adapter.new(server)
+  end
+
+  def drop_presences_table
+    ActiveRecord::Base.connection_pool.with_connection do |connection|
+      connection.execute("DROP TABLE IF EXISTS #{ActionCable::SubscriptionAdapter::EnhancedPostgresql::PRESENCES_TABLE}")
+    end
+  end
+end
