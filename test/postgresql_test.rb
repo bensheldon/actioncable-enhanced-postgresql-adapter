@@ -392,6 +392,38 @@ class PostgresqlAdapterTest < ActionCable::TestCase
     assert_kind_of Time, message.created_at
   end
 
+  # messages_since must never look further back than message_retention seconds, using the
+  # application clock (Time.now.utc), regardless of how old a `since` a caller passes in - see
+  # EnhancedPostgresql#messages_since / #clamp_since_to_retention_window.
+  def test_messages_since_clamps_since_to_the_retention_window
+    drop_messages_table
+
+    adapter = build_adapter(reliable_broadcasting: true, message_retention: 10)
+    pg_conn = ActiveRecord::Base.connection.raw_connection
+    pg_conn.exec(ActionCable::SubscriptionAdapter::EnhancedPostgresql::CREATE_BROADCASTS_TABLE_QUERY)
+
+    channel = adapter.send(:channel_with_prefix, "x")
+    pg_conn.exec_params(
+      "INSERT INTO #{ActionCable::SubscriptionAdapter::EnhancedPostgresql::BROADCASTS_TABLE} (channel, payload, created_at) VALUES ($1, $2, NOW() - INTERVAL '15 seconds')",
+      [channel, adapter.send(:encrypt_stored_payload, "old")]
+    )
+    pg_conn.exec_params(
+      "INSERT INTO #{ActionCable::SubscriptionAdapter::EnhancedPostgresql::BROADCASTS_TABLE} (channel, payload, created_at) VALUES ($1, $2, NOW() - INTERVAL '5 seconds')",
+      [channel, adapter.send(:encrypt_stored_payload, "recent")]
+    )
+
+    # A `since` far older than the retention window is clamped up to the retention floor, so
+    # only the row still inside the window (5s old) comes back - the 15s-old row is older than
+    # message_retention (10s) and is excluded even though Time.at(0) was requested.
+    assert_equal ["recent"], adapter.messages_since("x", Time.at(0)).map(&:payload)
+
+    # A `since` more recent than either stored row (unaffected by clamping) simply matches
+    # nothing, exactly as it would without clamping.
+    assert_equal [], adapter.messages_since("x", Time.now - 3)
+  ensure
+    pg_conn&.close
+  end
+
   private
 
   def build_adapter(config_overrides = {})

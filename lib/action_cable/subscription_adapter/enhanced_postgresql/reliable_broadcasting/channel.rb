@@ -16,15 +16,18 @@ class ActionCable::SubscriptionAdapter::EnhancedPostgresql
     module Channel
       extend ActiveSupport::Concern
 
-      # The Time (UTC) decrypted from the `enhanced-since` (or `enhanced_since`) channel param -
-      # see ReliableBroadcasting::SINCE_PARAM / SINCE_PARAM_ALTERNATIVES - accepting both string
-      # and symbol keys, or nil if it's absent, unparseable, or fails to decrypt (a forged or
-      # otherwise garbage token warns via #logger rather than raising - see
-      # ReliableBroadcasting.decrypt_since).
+      # The Time (UTC) parsed from the `enhanced-since` (or `enhanced_since`) channel param - see
+      # ReliableBroadcasting::SINCE_PARAM / SINCE_PARAM_ALTERNATIVES - accepting both string and
+      # symbol keys, or nil if it's absent or unparseable (a garbage value warns via #logger
+      # rather than raising - see ReliableBroadcasting.parse_timestamp). It's a plain ISO 8601
+      # timestamp, not a secret: it only ever selects a window of messages the subscriber is
+      # already authorized to receive (whatever #messages_since would return for this stream),
+      # and the adapter clamps it to message_retention regardless of what a client sends - see
+      # EnhancedPostgresql#messages_since.
       def replay_since
         return @replay_since if defined?(@replay_since)
 
-        @replay_since = decrypt_replay_since
+        @replay_since = parse_replay_since
       end
 
       # Streams#stop_stream_from / #stop_all_streams are public in ActionCable, so these overrides
@@ -41,34 +44,21 @@ class ActionCable::SubscriptionAdapter::EnhancedPostgresql
 
       private
 
-      # Decrypts the raw `enhanced-since` / `enhanced_since` param, if present, against the
-      # pubsub adapter's own payload_encryptor - see ReliableBroadcasting::Helper for the
-      # matching encrypt side. Never raises: a missing param, an adapter that doesn't support
-      # encrypted params, or a token that fails to decrypt/verify (forged, tampered with, wrong
-      # secret, or simply not one of ours) all just mean "nothing to replay", logged as a
-      # warning in the latter two cases.
-      def decrypt_replay_since
-        token = ReliableBroadcasting.since_param_token(params)
-        return nil if token.nil?
+      # Parses the raw `enhanced-since` / `enhanced_since` param, if present, as an ISO 8601
+      # timestamp - see ReliableBroadcasting::Helper for how it's rendered. Never raises: a
+      # missing param, or a value that doesn't parse (garbage, or simply not a timestamp), just
+      # means "nothing to replay", logged as a warning in the latter case.
+      def parse_replay_since
+        value = ReliableBroadcasting.since_param_value(params)
+        return nil if value.nil?
 
-        encryptor = replay_since_encryptor
-        return nil if encryptor.nil?
-
-        since = ReliableBroadcasting.decrypt_since(token, encryptor)
+        since = ReliableBroadcasting.parse_timestamp(value)
 
         if since.nil?
-          logger.warn "#{self.class.name} received an invalid or forged `#{ReliableBroadcasting::SINCE_PARAM}` param - ignoring it"
+          logger.warn "#{self.class.name} received an invalid `#{ReliableBroadcasting::SINCE_PARAM}` param - ignoring it"
         end
 
         since
-      end
-
-      def replay_since_encryptor
-        return pubsub.payload_encryptor if pubsub.respond_to?(:payload_encryptor)
-
-        logger.warn "#{self.class.name} received a `#{ReliableBroadcasting::SINCE_PARAM}` param, but #{pubsub.class} " \
-          "does not support encrypted params (no #payload_encryptor)"
-        nil
       end
 
       # Streams#stream_handler builds the inner, synchronous handler (decode + transmit) that

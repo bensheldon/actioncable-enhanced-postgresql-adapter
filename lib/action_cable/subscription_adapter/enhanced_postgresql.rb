@@ -145,15 +145,26 @@ module ActionCable
       # stored, or if the broadcasts table doesn't exist (reliable_broadcasting was never enabled
       # and no large payload was ever broadcast).
       #
+      # +since+ is clamped to the retention window before the query runs: a value older than
+      # message_retention seconds ago (by the application clock, i.e. Time.now.utc - the same
+      # clock the ReliableBroadcasting::Controller-captured timestamp a client sends back is
+      # drawn from) is raised to that floor, and a value in the future is capped at now. This
+      # means a `since` older than the retention window returns only the retained window -
+      # which is the guarantee #messages_since already documented, just now enforced here rather
+      # than left to whatever hasn't been cleaned up yet - so direct callers of #messages_since
+      # get the same bound the Channel concern's replay does. A caller that genuinely wants
+      # everything currently retained can pass e.g. `Time.at(0)`.
+      #
       # A row whose payload column fails to decrypt (e.g. it was written under a different
       # payload_encryptor_secret, or the column somehow holds garbage) is skipped - logged as a
       # warning rather than raised - since it can't be told apart from a forged row, and there is
       # nothing sensible to replay it as.
       def messages_since(channel, since)
         channel = channel_with_prefix(channel)
+        since = clamp_since_to_retention_window(since)
 
         with_broadcast_connection do |pg_conn|
-          result = pg_conn.exec_params(SELECT_MESSAGES_SINCE_QUERY, [channel, since.utc.iso8601(6)])
+          result = pg_conn.exec_params(SELECT_MESSAGES_SINCE_QUERY, [channel, since.iso8601(6)])
 
           result.filter_map do |row|
             created_at = row["created_at"]
@@ -260,6 +271,19 @@ module ActionCable
       end
 
       private
+
+      # Clamps +since+ (anything responding to #utc, e.g. a Time) to
+      # [Time.now.utc - message_retention, Time.now.utc] - see #messages_since.
+      def clamp_since_to_retention_window(since)
+        now = Time.now.utc
+        floor = now - message_retention
+        since = since.utc
+
+        return floor if since < floor
+        return now if since > now
+
+        since
+      end
 
       # Encrypts-and-signs +plaintext+ (a broadcast payload) for storage in #{BROADCASTS_TABLE},
       # under BROADCAST_PAYLOAD_PURPOSE - see #payload_encryptor.

@@ -77,10 +77,12 @@ class HotwireReliableBroadcastingTest < ActionDispatch::SystemTestCase
 
     assert_selector "turbo-cable-stream-source[data-enhanced-since]", visible: :all
 
-    # The value is an encrypted-and-signed token, not the plain ISO 8601 timestamp - a client
-    # must not be able to read or forge it.
-    token = find("turbo-cable-stream-source", visible: :all)["data-enhanced-since"]
-    refute_match(/\A\d{4}-\d{2}-\d{2}T/, token)
+    # The value is a plain ISO 8601 UTC timestamp - not secret, and not encrypted - see the
+    # "Security" section of the README: it only ever selects a window of messages the subscriber
+    # is already authorized to receive, and the server clamps it to message_retention regardless
+    # of what value it's given.
+    value = find("turbo-cable-stream-source", visible: :all)["data-enhanced-since"]
+    assert_match(/\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z\z/, value)
 
     # Replayed: the controller broadcast this before the browser could possibly have
     # subscribed, yet it shows up once the subscription confirms and replay runs.

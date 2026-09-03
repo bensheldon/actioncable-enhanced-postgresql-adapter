@@ -43,7 +43,7 @@ production:
 
 The following configuration options are available:
 
-- `payload_encryptor_secret` - The secret used to encrypt large payload ID's, stored broadcast payloads at rest, and (with [reliable broadcasting](#reliable-broadcasting)/[presence](#presence)) the `enhanced-since`/`enhanced-presence` channel params. Defaults to `Rails.application.secret_key_base` or the `SECRET_KEY_BASE` environment variable unless explicitly specified.
+- `payload_encryptor_secret` - The secret used to encrypt large payload ID's, stored broadcast payloads at rest, and (with [presence](#presence)) the `enhanced-presence` channel param. Defaults to `Rails.application.secret_key_base` or the `SECRET_KEY_BASE` environment variable unless explicitly specified.
 - `url` - Set this if you want to use a different database than the one provided by ActiveRecord. Must be a valid PostgreSQL connection string.
 - `connection_pool_size` - Set this in conjunction with `url` to set the size of the postgres connection pool used for broadcasts. Defaults to `RAILS_MAX_THREADS` environment variable or falls back to 5.
 - `reliable_broadcasting` - Set this to `true` to store every broadcast payload so it can be replayed to a client that subscribes after the broadcast happened. See [Reliable broadcasting](#reliable-broadcasting). Defaults to `false`.
@@ -72,9 +72,9 @@ Setting `reliable_broadcasting: true` in `cable.yml` closes that gap. When it's 
 The flow looks like this:
 
 1. A controller records the current time (`Time.now.utc`) before the action runs.
-2. A view helper encrypts that timestamp and embeds the resulting token in the rendered HTML, typically as a `data-*` attribute.
+2. A view helper formats that timestamp as a plain ISO 8601 UTC string and embeds it in the rendered HTML, typically as a `data-*` attribute.
 3. The client passes it back as the `enhanced-since` channel parameter when it subscribes.
-4. Once the channel's subscription to Postgres (`LISTEN`) is confirmed, the server decrypts the token back into a timestamp and looks up every message stored for that stream with a `created_at` at or after it, delivering them through the normal stream handler, oldest first. Live messages that arrive while the replay runs are delivered as usual.
+4. Once the channel's subscription to Postgres (`LISTEN`) is confirmed, the server parses the timestamp back and looks up every message stored for that stream with a `created_at` at or after it - clamped to at most `message_retention` seconds back, no matter what the client sent - delivering them through the normal stream handler, oldest first. Live messages that arrive while the replay runs are delivered as usual.
 
 ### Integrating into a Rails app
 
@@ -139,7 +139,7 @@ If you render several `turbo_stream_from` tags on one page, pass `data: { enhanc
 
 #### Checking that it works
 
-1. Open a page that subscribes to a channel and confirm the rendered HTML contains the token (a `data-enhanced-since` attribute, or wherever your page embeds it) - and that it is *not* a readable timestamp.
+1. Open a page that subscribes to a channel and confirm the rendered HTML contains the timestamp (a `data-enhanced-since` attribute, or wherever your page embeds it) - a plain, readable ISO 8601 string.
 2. In the Rails log for the WebSocket connection you should see `Turbo::StreamsChannel is streaming from ...` followed by `Turbo::StreamsChannel replayed N message(s) from ... since ...` whenever there was something to catch up on.
 3. To reproduce the race on purpose, add `sleep 5` to the controller action, load the page, and broadcast to the stream from a Rails console during those five seconds. The broadcast shows up in the browser as soon as the page connects.
 
@@ -156,7 +156,7 @@ module ApplicationCable
 end
 ```
 
-Then get `action_cable_enhanced_since_param` (and, if you're using [presence](#presence), `action_cable_enhanced_presence_param(value)`) into your page however suits you - a `data-*` attribute on any element your JavaScript can reach is the simplest option - and send them as the `enhanced-since` / `enhanced-presence` channel params when calling `consumer.subscriptions.create`:
+Then get `action_cable_enhanced_since_param` (and, if you're using [presence](#presence), `action_cable_enhanced_presence_param(value)`) into your page however suits you - a `data-*` attribute on any element your JavaScript can reach is the simplest option - and send them as the `enhanced-since` / `enhanced-presence` channel params when calling `consumer.subscriptions.create`. `action_cable_enhanced_since_param` renders a plain, readable ISO 8601 timestamp - it's not secret and doesn't need to be encrypted (see [Security](#security) above) - while `action_cable_enhanced_presence_param` still renders an encrypted token:
 
 ```erb
 <%# app/views/rooms/show.html.erb %>
@@ -196,17 +196,17 @@ class ApplicationController < ActionController::API
 end
 ```
 
-The controller concern adds `action_cable_since` (a UTC `Time`, captured before the action) and the helper adds `action_cable_enhanced_since_param` (that time as an encrypted token).
+The controller concern adds `action_cable_since` (a UTC `Time`, captured before the action) and the helper adds `action_cable_enhanced_since_param` (that time formatted as a plain ISO 8601 string).
 
 ### Security
 
-The `enhanced-since` value sent to the browser is never the plain timestamp - it's an [`ActiveSupport::MessageEncryptor`](https://api.rubyonrails.org/classes/ActiveSupport/MessageEncryptor.html) token, encrypted and signed with the adapter's own `payload_encryptor` (see [Configuration](#configuration)) under the purpose `"enhanced-since"`. A client can read the token back on later requests but can't decrypt it, tamper with it, or forge one of their own to fish for messages from an arbitrary point in time. On the way back in, the channel decrypts and verifies it the same way; anything that fails to decrypt or verify - a missing/invalid signature, a mismatched purpose, or simply garbage - is treated exactly like a missing param (no replay, just the subscription confirmation) and logged as a warning, never raised.
+The `enhanced-since` value sent to the browser is a plain ISO 8601 UTC timestamp (e.g. `2026-09-02T18:55:12.123456Z`) - it is not encrypted, and it doesn't need to be. It isn't secret: it only ever selects a window of messages the subscriber is already authorized to receive on that stream (exactly what `messages_since` would return), never anything a client couldn't already get by subscribing at that moment. And it can't be used to fish further back than intended - whatever value comes back, genuine or a client-supplied one, `messages_since` clamps it to `message_retention` seconds ago before running the query, so a client can never request more history than the server already retains (see [`messages_since`](#messages_since) below). On the way back in, the channel parses the value as ISO 8601; anything that fails to parse - a missing param or simply garbage - is treated exactly like a missing param (no replay, just the subscription confirmation) and logged as a warning, never raised.
 
-The stored messages themselves are protected the same way: every payload written to `action_cable_enhanced_broadcasts` is encrypted-and-signed with `payload_encryptor` (under its own purpose, distinct from `"enhanced-since"`) before the INSERT, and decrypted again by `messages_since` and by the large-payload fetch path. A row read directly out of the database - by anyone with database access, or by another process pointed at the same database - can't be read or forged; see [Caveats](#caveats) below for what a `payload_encryptor_secret` rotation means for rows already stored.
+The stored messages themselves are protected the same way: every payload written to `action_cable_enhanced_broadcasts` is encrypted-and-signed with `payload_encryptor` before the INSERT, and decrypted again by `messages_since` and by the large-payload fetch path. A row read directly out of the database - by anyone with database access, or by another process pointed at the same database - can't be read or forged; see [Caveats](#caveats) below for what a `payload_encryptor_secret` rotation means for rows already stored.
 
 ### `messages_since`
 
-The adapter exposes `messages_since(channel, since)`, returning an array of `Message` structs (`id`, `channel`, `payload`, `created_at`), ordered oldest first. It's what the `Channel` concern calls internally, but it's also available directly if you need to inspect or replay history yourself:
+The adapter exposes `messages_since(channel, since)`, returning an array of `Message` structs (`id`, `channel`, `payload`, `created_at`), ordered oldest first. `since` is clamped to at most `message_retention` seconds ago before the query runs, no matter what's passed in - so a `since` older than the retention window simply returns the whole retained window, and a direct caller gets the same guarantee the `Channel` concern's replay does. It's what the `Channel` concern calls internally, but it's also available directly if you need to inspect or replay history yourself:
 
 ```ruby
 adapter = ActionCable.server.pubsub
@@ -220,8 +220,8 @@ It returns `[]` if nothing has been stored for that channel, or if `reliable_bro
 ### Caveats
 
 - **Delivery is at-least-once, not exactly-once.** A message broadcast in the small window between the subscription's `LISTEN` becoming active and the replay query running can be delivered twice: once live, once replayed. A reconnect also replays the entire retained window again using the original `since` value, which is exactly what makes reconnects reliable, but it means handlers need to be idempotent. Turbo Streams' `replace` and `update` actions are idempotent by nature, and so are `append` / `prepend` of elements that carry an `id`, since Turbo will not insert a duplicate.
-- **Replay is bounded by `message_retention`.** Only messages younger than `message_retention` seconds (120 by default) are guaranteed to still be in the table. A `since` timestamp older than that will only get back whatever hasn't been cleaned up yet.
-- **Clocks must be in sync.** The `since` timestamp is captured on the Rails server, but compared against `created_at` timestamps generated by the database clock. Keep both clocks synchronized (NTP) or the comparison can miss messages or replay too much.
+- **Replay is bounded by `message_retention` - as a hard limit, not just a cleanup side effect.** `messages_since` clamps `since` to at most `message_retention` seconds ago (120 by default) before running the query, so a `since` older than that returns only the retained window - it can never come back empty-handed because of stale data, and a client can never request more history than the server is willing to keep, however old a `since` value it sends.
+- **Clocks must be in sync.** The `since` timestamp is captured on the Rails server (and the retention clamp is applied against that same application clock), but compared against `created_at` timestamps generated by the database clock. Keep both clocks synchronized (NTP) or the comparison can miss messages or replay too much.
 - **Stored payloads are encrypted with `payload_encryptor`, so every process sharing the database needs the same secret.** `payload_encryptor_secret` (or the `secret_key_base`/`SECRET_KEY_BASE` it falls back to) must be identical across every process that broadcasts or replays against a given database - a mismatch means one process's rows are just undecryptable garbage to another. Rotating the secret has the same effect on everything already stored: older rows become permanently undecryptable, which isn't a correctness problem - `messages_since` (and the large-payload fetch path) just skips them, logging a warning, rather than raising or replaying garbage - but it does mean a rotation quietly drops in-flight replay history. Channel names, and (if you're using [presence](#presence)) presence values, are stored as plain text - only the `payload` column is encrypted.
 - **There's a performance cost.** With `reliable_broadcasting` enabled, every broadcast does one extra INSERT into `action_cable_enhanced_broadcasts` in addition to the NOTIFY. See [Performance](#performance).
 
@@ -259,7 +259,7 @@ Rails.application.config.to_prepare do
 end
 ```
 
-Pass the value with the `Helper`'s `action_cable_enhanced_presence_param`, which encrypts it exactly like `action_cable_enhanced_since_param` does for the replay timestamp:
+Pass the value with the `Helper`'s `action_cable_enhanced_presence_param`, which encrypts it (unlike `action_cable_enhanced_since_param`, which is a plain timestamp - see [Security](#security-1) below):
 
 ```erb
 <%# app/views/rooms/show.html.erb %>
@@ -334,7 +334,7 @@ If you're using Turbo's `turbo_stream_from @room`, the broadcasting name is `@ro
 
 ### Security
 
-Like `enhanced-since`, the `enhanced-presence` value is never sent or accepted as plain text - it's encrypted and signed with the adapter's `payload_encryptor` under the purpose `"enhanced-presence"` (a different purpose than `"enhanced-since"`, so one kind of token can never be replayed as the other). A client can't read what a presence token decrypts to, tamper with it, or forge an arbitrary presence value to impersonate someone else; a token that fails to decrypt or verify is treated as no presence param at all (nothing is stored, no timer starts) and logged as a warning.
+Unlike `enhanced-since` (a plain, non-secret timestamp - see [Security](#security) above), the `enhanced-presence` value is never sent or accepted as plain text - it's encrypted and signed with the adapter's `payload_encryptor` under the purpose `"enhanced-presence"`, a purpose distinct enough from anything else the encryptor is used for that a token produced for one purpose is never accepted for another. A client can't read what a presence token decrypts to, tamper with it, or forge an arbitrary presence value to impersonate someone else; a token that fails to decrypt or verify is treated as no presence param at all (nothing is stored, no timer starts) and logged as a warning.
 
 ## Development
 

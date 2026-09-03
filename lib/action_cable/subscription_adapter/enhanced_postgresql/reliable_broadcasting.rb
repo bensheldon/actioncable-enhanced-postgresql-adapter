@@ -13,8 +13,7 @@ require "time"
 # Rails constants (ActionController::Base, ActionView helpers) once actually included into them.
 class ActionCable::SubscriptionAdapter::EnhancedPostgresql
   module ReliableBroadcasting
-    # The primary wire name for the channel param. Also used as the MessageEncryptor `purpose:`
-    # the token is confined to.
+    # The primary wire name for the channel param.
     SINCE_PARAM = "enhanced-since"
     # turbo-rails forwards a `data-enhanced-since` attribute (see the README's Hotwire
     # walkthrough) as the channel param `enhanced_since` (it snake_cases dasherized data
@@ -42,33 +41,12 @@ class ActionCable::SubscriptionAdapter::EnhancedPostgresql
         nil
       end
 
-      # Time -> an encrypted-and-signed token safe to embed in HTML (typically a data-*
-      # attribute). +encryptor+ is an ActiveSupport::MessageEncryptor - in practice the adapter's
-      # own #payload_encryptor, so a client can't forge or read the timestamp it sends back.
-      def encrypt_since(time, encryptor)
-        encryptor.encrypt_and_sign(format_timestamp(time), purpose: SINCE_PARAM)
-      end
-
-      # Inverse of .encrypt_since. Returns a Time, or nil if +token+ is missing, blank, or
-      # doesn't decrypt/verify against +encryptor+ (wrong secret, wrong purpose, tampered with,
-      # or simply not a token this method produced) - never raises, since this is ultimately fed
-      # by a client-controlled channel param.
-      def decrypt_since(token, encryptor)
-        return nil unless token.respond_to?(:to_str)
-
-        string = token.to_str
-        return nil if string.empty?
-
-        parse_timestamp(encryptor.decrypt_and_verify(string, purpose: SINCE_PARAM))
-      rescue ActiveSupport::MessageEncryptor::InvalidMessage, ActiveSupport::MessageVerifier::InvalidSignature, ArgumentError, TypeError
-        nil
-      end
-
       # Looks up the `since` param under SINCE_PARAM or any of SINCE_PARAM_ALTERNATIVES, trying
       # both a string and a symbol key for each (channel params are normally a
       # HashWithIndifferentAccess already, but this is defensive for anything that isn't).
-      # Returns the raw value (nil if none of the keys are present) - callers decrypt it.
-      def since_param_token(params)
+      # Returns the raw value (nil if none of the keys are present) - callers parse it with
+      # .parse_timestamp.
+      def since_param_value(params)
         ([SINCE_PARAM] + SINCE_PARAM_ALTERNATIVES).each do |key|
           value = params[key]
           value = params[key.to_sym] if value.nil?

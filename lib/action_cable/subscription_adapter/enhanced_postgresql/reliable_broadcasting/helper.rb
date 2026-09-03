@@ -6,13 +6,14 @@ class ActionCable::SubscriptionAdapter::EnhancedPostgresql
     # automatically by the gem's Railtie for ActionController::Base, see README for how to
     # register it by hand elsewhere).
     module Helper
-      # An encrypted-and-signed token embedding the timestamp captured by
-      # ReliableBroadcasting::Controller, suitable for a channel param or a data-* attribute. A
-      # client can see the token but can't read or forge its content - see
-      # #action_cable_param_encryptor and ReliableBroadcasting.encrypt_since.
+      # A plain ISO 8601 UTC timestamp (the time captured by ReliableBroadcasting::Controller),
+      # suitable for a channel param or a data-* attribute. It's not secret and isn't encrypted:
+      # it only ever selects a window of already-authorized messages to replay, and the server
+      # clamps it to message_retention regardless of what value it's given - see
+      # EnhancedPostgresql#messages_since and the README's "Reliable broadcasting" section.
       def action_cable_enhanced_since_param
         time = controller.action_cable_since if respond_to?(:controller) && controller.respond_to?(:action_cable_since)
-        ReliableBroadcasting.encrypt_since(time || (@action_cable_since ||= Time.now.utc), action_cable_param_encryptor)
+        ReliableBroadcasting.format_timestamp(time || (@action_cable_since ||= Time.now.utc))
       end
 
       # An encrypted-and-signed token of `value.to_s`, suitable for a channel param or a data-*
@@ -26,11 +27,12 @@ class ActionCable::SubscriptionAdapter::EnhancedPostgresql
 
       private
 
-      # The ActiveSupport::MessageEncryptor used to encrypt values embedded in the page (the
-      # `enhanced-since` param, and, if the Presence concern is also in use, `enhanced-presence`).
-      # Defined as its own method - rather than reaching for ActionCable.server.pubsub inline -
-      # so tests can override it on a view object to inject an encryptor built from a known
-      # secret without booting a real adapter.
+      # The ActiveSupport::MessageEncryptor used to encrypt values embedded in the page - only
+      # `enhanced-presence`, if the Presence concern is in use (`enhanced-since` is a plain,
+      # unencrypted timestamp - see #action_cable_enhanced_since_param). Defined as its own
+      # method - rather than reaching for ActionCable.server.pubsub inline - so tests can
+      # override it on a view object to inject an encryptor built from a known secret without
+      # booting a real adapter.
       def action_cable_param_encryptor
         pubsub = ActionCable.server.pubsub
 
