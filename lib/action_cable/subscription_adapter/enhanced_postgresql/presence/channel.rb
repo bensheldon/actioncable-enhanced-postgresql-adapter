@@ -23,15 +23,33 @@ class ActionCable::SubscriptionAdapter::EnhancedPostgresql
         after_unsubscribe :stop_enhanced_presence
       end
 
-      # The String decrypted from the `enhanced-presence` (or `enhanced_presence`) channel param
-      # - see Presence::PARAM / PARAM_ALTERNATIVES - accepting both string and symbol keys, or
-      # nil if it's absent, blank, too long, or fails to decrypt (a forged or otherwise garbage
-      # token warns via #logger rather than raising - see Presence.decrypt). No presence param
-      # at all means this concern does nothing: no rows are ever written, no timer is started.
+      # The value to register as this subscription's presence - nil means no presence at all
+      # for this subscription (nothing is stored, no timer starts).
+      #
+      # The default implementation decrypts and returns the `enhanced-presence` (or
+      # `enhanced_presence`) channel param - see Presence::PARAM / PARAM_ALTERNATIVES - accepting
+      # both string and symbol keys. A forged or otherwise garbage token warns via #logger rather
+      # than raising (see Presence.decrypt) and is treated the same as no param at all.
+      #
+      # Override this in an including channel to compute presence in Ruby instead of trusting
+      # the frontend - e.g. from something the connection already knows:
+      #
+      #   class ChatChannel < ApplicationCable::Channel
+      #     def enhanced_presence
+      #       current_user&.name
+      #     end
+      #   end
+      #
+      # Whatever your override returns wins outright - the frontend's `enhanced-presence` param
+      # is only consulted if your override calls `super`. The return value need not already be a
+      # String: anything is normalized with Presence.normalize (nil stays nil; anything else is
+      # converted with #to_s and dropped - with a #logger warning - if it's blank or longer than
+      # Presence::MAX_LENGTH characters). See #resolved_enhanced_presence, which every internal
+      # call site (registration, heartbeat touches, removal) uses instead of calling this method
+      # directly, so an override runs exactly once per subscription no matter how many streams
+      # it's touching or how many heartbeats go by.
       def enhanced_presence
-        return @enhanced_presence if defined?(@enhanced_presence)
-
-        @enhanced_presence = decrypt_enhanced_presence
+        decrypt_enhanced_presence
       end
 
       # Streams#stop_stream_from / #stop_all_streams are public in ActionCable, so these
@@ -48,6 +66,31 @@ class ActionCable::SubscriptionAdapter::EnhancedPostgresql
       end
 
       private
+
+      # Memoized wrapper around #enhanced_presence - the public, overridable hook above. Every
+      # internal call site uses this instead, so a channel's (possibly overridden) #enhanced_presence
+      # - which might be an expensive or otherwise side-effecting call - runs exactly once per
+      # subscription, and every call site (registration, each heartbeat, removal) agrees on the
+      # same resolved value for the life of the subscription.
+      #
+      # Normalizes whatever #enhanced_presence returned via Presence.normalize - see there for
+      # the exact rules. A value that came back non-nil but was normalized away to nil (blank
+      # after stripping, or over Presence::MAX_LENGTH characters) is warned about here, since
+      # #enhanced_presence's default implementation already warns for its own reason (a forged
+      # token) and an overriding channel gets no other feedback that its return value was dropped.
+      def resolved_enhanced_presence
+        return @resolved_enhanced_presence if defined?(@resolved_enhanced_presence)
+
+        value = enhanced_presence
+        normalized = Presence.normalize(value)
+
+        if !value.nil? && normalized.nil?
+          logger.warn "#{self.class.name}#enhanced_presence returned a blank or over " \
+            "#{Presence::MAX_LENGTH}-character value - ignoring it"
+        end
+
+        @resolved_enhanced_presence = normalized
+      end
 
       # A random identifier unique to this channel instance (i.e. this one subscription), so the
       # same +enhanced_presence+ value from two different subscriptions (two tabs, two devices,
@@ -97,7 +140,7 @@ class ActionCable::SubscriptionAdapter::EnhancedPostgresql
       end
 
       def schedule_enhanced_presence_registration
-        return if enhanced_presence.nil?
+        return if resolved_enhanced_presence.nil?
 
         unless pubsub.respond_to?(:touch_presence)
           unless @enhanced_presence_unsupported_warned
@@ -147,7 +190,7 @@ class ActionCable::SubscriptionAdapter::EnhancedPostgresql
 
       def touch_enhanced_presence_streams
         enhanced_presence_streams.each do |broadcasting|
-          pubsub.touch_presence(broadcasting, enhanced_presence, enhanced_presence_subscription_key)
+          pubsub.touch_presence(broadcasting, resolved_enhanced_presence, enhanced_presence_subscription_key)
         end
       end
 
@@ -162,9 +205,9 @@ class ActionCable::SubscriptionAdapter::EnhancedPostgresql
       end
 
       def remove_enhanced_presence(broadcasting)
-        return if enhanced_presence.nil? || !pubsub.respond_to?(:remove_presence)
+        return if resolved_enhanced_presence.nil? || !pubsub.respond_to?(:remove_presence)
 
-        pubsub.remove_presence(broadcasting, enhanced_presence, enhanced_presence_subscription_key)
+        pubsub.remove_presence(broadcasting, resolved_enhanced_presence, enhanced_presence_subscription_key)
       rescue => e
         logger.error "#{self.class.name} failed to remove enhanced presence: #{e.class}: #{e.message}"
       end

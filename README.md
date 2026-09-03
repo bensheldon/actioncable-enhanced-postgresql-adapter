@@ -280,6 +280,45 @@ consumer.subscriptions.create(
 
 `enhanced_presence` (the underscored spelling turbo-rails produces from a `data-enhanced-presence` attribute) is accepted too, exactly like `enhanced_since`/`enhanced-since`.
 
+### Computing presence on the server
+
+Passing the value from the frontend, as above, isn't the only option. `Presence::Channel` calls a single `enhanced_presence` method to get the value to register - overridden by default to decrypt the frontend param - so an including channel can override it to compute the value in Ruby instead, from whatever the channel already knows:
+
+```ruby
+# app/channels/application_cable/channel.rb
+module ApplicationCable
+  class Channel < ActionCable::Channel::Base
+    include ActionCable::SubscriptionAdapter::EnhancedPostgresql::Presence::Channel
+  end
+end
+
+# app/channels/chat_channel.rb
+class ChatChannel < ApplicationCable::Channel
+  def enhanced_presence
+    current_user&.name
+  end
+end
+```
+
+`current_user` is available directly on the channel like this whenever the connection declares `identified_by :current_user` (the standard Action Cable authentication pattern) - no extra wiring needed.
+
+Whatever your override returns wins outright: the frontend's `enhanced-presence` param is only consulted if your override calls `super`, and is ignored entirely otherwise. Return `nil` for "no presence for this subscription" - exactly as if no param had been sent. The value doesn't need to already be a string; it's normalized the same way a decrypted frontend token is (converted with `#to_s`, dropped with a warning if it comes out blank or over `Presence::MAX_LENGTH` characters), and whatever it resolves to is fetched at most once per subscription, no matter how many streams it's touching or how many heartbeats go by, so an expensive or side-effecting override (like a `current_user` lookup) never runs twice.
+
+`Turbo::StreamsChannel` isn't a channel you define yourself, so include an override module into it the same way you include the concern itself - after `Presence::Channel`, so it takes precedence, calling `super` to fall back to the frontend-supplied value when there's nothing server-side to use:
+
+```ruby
+# config/initializers/reliable_turbo_streams.rb
+Rails.application.config.to_prepare do
+  Turbo::StreamsChannel.include(ActionCable::SubscriptionAdapter::EnhancedPostgresql::Presence::Channel)
+
+  Turbo::StreamsChannel.include(Module.new do
+    def enhanced_presence
+      current_user&.name || super
+    end
+  end)
+end
+```
+
 Then ask for the list wherever you need it - a controller, a background job, another channel:
 
 ```ruby

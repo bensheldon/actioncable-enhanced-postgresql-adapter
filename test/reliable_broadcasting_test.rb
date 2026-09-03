@@ -27,6 +27,10 @@ end
 
 class FakeConnection
   attr_reader :server, :identifiers, :config, :subscriptions, :logger, :log_io
+  # A stand-in for whatever a real app's connection would expose via `identified_by` (e.g.
+  # `current_user`) - used by PresenceOverrideTestChannel below to demonstrate a channel
+  # computing its own presence value in Ruby instead of trusting the frontend-supplied param.
+  attr_accessor :current_user_name
 
   def initialize(server)
     @server = server
@@ -78,6 +82,20 @@ class PresenceTestChannel < ActionCable::Channel::Base
 
   def subscribed
     stream_from params[:room]
+  end
+end
+
+# Demonstrates (and lets tests verify) a channel computing its own presence value in Ruby - e.g.
+# from `current_user` in a real app - instead of trusting the `enhanced-presence` frontend param.
+# #enhanced_presence_call_count lets tests assert the override runs at most once per subscription
+# no matter how many streams it's touching or how many heartbeats go by (see
+# Presence::Channel#resolved_enhanced_presence).
+class PresenceOverrideTestChannel < PresenceTestChannel
+  attr_accessor :enhanced_presence_call_count
+
+  def enhanced_presence
+    self.enhanced_presence_call_count = (enhanced_presence_call_count || 0) + 1
+    connection.current_user_name
   end
 end
 
@@ -546,6 +564,29 @@ class PresenceModuleTest < ActionCable::TestCase
     assert_nil Presence.param_token({})
   end
 
+  def test_normalize_returns_nil_for_nil
+    assert_nil Presence.normalize(nil)
+  end
+
+  def test_normalize_stringifies_non_string_values
+    assert_equal "42", Presence.normalize(42)
+    assert_equal "alice", Presence.normalize(:alice)
+  end
+
+  def test_normalize_returns_nil_for_blank_after_stripping
+    assert_nil Presence.normalize("")
+    assert_nil Presence.normalize("   ")
+  end
+
+  def test_normalize_returns_nil_for_a_value_over_max_length
+    assert_nil Presence.normalize("a" * (Presence::MAX_LENGTH + 1))
+    assert_equal "a" * Presence::MAX_LENGTH, Presence.normalize("a" * Presence::MAX_LENGTH)
+  end
+
+  def test_normalize_passes_through_an_ordinary_string
+    assert_equal "alice", Presence.normalize("alice")
+  end
+
   private
 
   def build_encryptor
@@ -589,11 +630,44 @@ class PresenceChannelTest < ActionCable::TestCase
     ActiveRecord::Base.establish_connection database_config
     ActiveRecord::Base.connection.connect!
 
+    # Every #build_server below spins up its own worker pool, event loop and (once a channel
+    # subscribes) a Postgres LISTEN thread - none of which ActionCable ever tears down on its
+    # own outside of a real Rack server shutdown. Left alone, those background threads pile up
+    # for the rest of the process (every subsequent test in this file builds more on top), and
+    # the growing thread count adds enough GVL scheduling noise to occasionally delay a
+    # worker-pool job (a registration, a heartbeat) past a test's poll deadline - most likely to
+    # bite a test like #test_two_connections_with_different_presences_are_both_listed, which
+    # needs *two* independent async registrations to land inside the same window. Tracking every
+    # server built here and shutting each one down in #teardown keeps the number of live
+    # background threads bounded to what the *current* test needs, closing that gap.
+    @built_servers = []
+
     super
   end
 
   def teardown
     super
+
+    @built_servers.each do |server|
+      # #restart halts the worker pool (fast, synchronous) and shuts down pubsub - but the
+      # latter joins the adapter's Listener thread, which only wakes up (and notices the
+      # shutdown request) at its next ~1s `wait_for_notify` poll. Do that part on a throwaway
+      # thread instead of blocking here, so a slow-to-notice Listener doesn't turn every single
+      # test's teardown into an extra ~1s of dead time - we only need these torn down before
+      # *too many* accumulate, not before the next test starts.
+      server.worker_pool.halt if server.instance_variable_get(:@worker_pool)
+      Thread.new { server.pubsub.shutdown } if server.instance_variable_get(:@pubsub)
+
+      event_loop = server.instance_variable_get(:@event_loop)
+      if event_loop
+        event_loop.stop
+        # #stop only flags the reactor thread to exit at its next wakeup - it doesn't touch the
+        # separate thread pool executor StreamEventLoop spawns (and never tears down itself) the
+        # first time anything is #post-ed to it, e.g. to deliver our own subscription
+        # confirmation. Reach in and shut that down too, or it's one more thread leaked per test.
+        event_loop.instance_variable_get(:@executor)&.shutdown
+      end
+    end
 
     ActiveRecord::Base.connection_handler.clear_all_connections!
   end
@@ -764,6 +838,75 @@ class PresenceChannelTest < ActionCable::TestCase
     assert_equal [], server.pubsub.presences(room)
   end
 
+  # A channel can override #enhanced_presence to compute its presence value in Ruby - e.g. from
+  # `current_user` - instead of trusting the frontend-supplied param. Here there's no presence
+  # param at all; the override alone is enough to register a presence.
+  def test_channel_can_override_enhanced_presence_to_compute_it_in_ruby
+    server = build_server
+    room = unique_room
+
+    connection, channel = build_channel(server, room: room, channel_class: PresenceOverrideTestChannel)
+    connection.current_user_name = "carol"
+    channel.subscribe_to_channel
+
+    assert_confirmation(connection)
+    assert wait_for_presences(server, room, ["carol"])
+  ensure
+    channel&.unsubscribe_from_channel
+  end
+
+  # Whatever an #enhanced_presence override returns wins outright - the frontend's param is only
+  # consulted if the override calls `super`, which PresenceOverrideTestChannel does not.
+  def test_channel_override_wins_over_a_valid_frontend_presence_token
+    server = build_server
+    room = unique_room
+
+    connection, channel = build_channel(server, room: room, presence: "alice", channel_class: PresenceOverrideTestChannel)
+    connection.current_user_name = "carol"
+    channel.subscribe_to_channel
+
+    assert_confirmation(connection)
+    assert wait_for_presences(server, room, ["carol"])
+  ensure
+    channel&.unsubscribe_from_channel
+  end
+
+  def test_channel_override_returning_nil_stores_nothing_and_starts_no_timer
+    server = build_server
+    room = unique_room
+
+    connection, channel = build_channel(server, room: room, channel_class: PresenceOverrideTestChannel)
+    connection.current_user_name = nil
+    channel.subscribe_to_channel
+
+    assert_confirmation(connection)
+
+    sleep 0.3
+    assert_equal [], server.pubsub.presences(room)
+    assert_nil channel.instance_variable_get(:@enhanced_presence_timer)
+  end
+
+  # #enhanced_presence is memoized (via #resolved_enhanced_presence) so an override - which might
+  # be an expensive or side-effecting call - runs exactly once per subscription, no matter how
+  # many heartbeats go by.
+  def test_channel_override_is_invoked_only_once_per_subscription_across_heartbeats
+    server = build_server(presence_heartbeat_interval: 0.3)
+    room = unique_room
+
+    connection, channel = build_channel(server, room: room, channel_class: PresenceOverrideTestChannel)
+    connection.current_user_name = "carol"
+    channel.subscribe_to_channel
+
+    assert_confirmation(connection)
+    assert wait_for_presences(server, room, ["carol"])
+
+    sleep 1 # long enough for at least two more heartbeats at a 0.3s interval
+
+    assert_equal 1, channel.enhanced_presence_call_count
+  ensure
+    channel&.unsubscribe_from_channel
+  end
+
   private
 
   def unique_room
@@ -774,10 +917,11 @@ class PresenceChannelTest < ActionCable::TestCase
     server = ActionCable::Server::Base.new(config: ActionCable::Server::Configuration.new)
     server.config.cable = cable_config.merge(overrides).with_indifferent_access
     server.config.logger = Logger.new(StringIO.new).tap { |l| l.level = Logger::UNKNOWN }
+    @built_servers << server
     server
   end
 
-  def build_channel(server, room:, presence: :none, presence_token: nil)
+  def build_channel(server, room:, presence: :none, presence_token: nil, channel_class: PresenceTestChannel)
     connection = FakeConnection.new(server)
     params = {"room" => room}
     if presence_token
@@ -785,7 +929,7 @@ class PresenceChannelTest < ActionCable::TestCase
     elsif presence != :none
       params[Presence::PARAM] = Presence.encrypt(presence, server.pubsub.payload_encryptor)
     end
-    channel = PresenceTestChannel.new(connection, '{"channel":"PresenceTestChannel"}', params.with_indifferent_access)
+    channel = channel_class.new(connection, '{"channel":"PresenceTestChannel"}', params.with_indifferent_access)
     [connection, channel]
   end
 

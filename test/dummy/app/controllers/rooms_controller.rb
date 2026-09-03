@@ -4,6 +4,11 @@ class RoomsController < ApplicationController
   def show
     @room = "room-#{params[:id]}"
     @reliable = params[:reliable] != "false"
+    # Simulates a channel computing presence server-side (from something it already knows) rather
+    # than trusting the frontend param - see the `server_presence` override in
+    # config/initializers/reliable_turbo_streams.rb. A real app would read `current_user` instead
+    # of a query param; there's no authentication in this dummy app to demonstrate that with.
+    @server_presence = params[:server_presence]
 
     if params[:broadcast_during_render] == "true"
       # This runs *after* the Railtie's prepend_before_action has already captured

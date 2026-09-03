@@ -26,6 +26,22 @@ class ActionCable::SubscriptionAdapter::EnhancedPostgresql
     MAX_LENGTH = 255
 
     class << self
+      # The single place the "is this a usable presence value" rules live - used both to
+      # validate a decrypted frontend token (.decrypt below) and, by Channel#resolved_enhanced_presence,
+      # to validate whatever a channel's (possibly overridden) #enhanced_presence returns.
+      #
+      # nil stays nil (that's "no presence" - not an error). Anything else is converted with
+      # #to_s, then nil'd out if it's blank after stripping, or longer than MAX_LENGTH characters
+      # - either way, returns a String or nil, never raises.
+      def normalize(value)
+        return nil if value.nil?
+
+        string = value.to_s
+        return nil if string.strip.empty? || string.length > MAX_LENGTH
+
+        string
+      end
+
       # value.to_s -> an encrypted-and-signed token safe to embed in HTML (a data-* attribute).
       # +encryptor+ is an ActiveSupport::MessageEncryptor - in practice the adapter's own
       # #payload_encryptor, so a client can't forge or read the presence value it sends back.
@@ -36,8 +52,8 @@ class ActionCable::SubscriptionAdapter::EnhancedPostgresql
       # Inverse of .encrypt. Returns a String, or nil if +token+ is missing, blank, doesn't
       # decrypt/verify against +encryptor+ (wrong secret, wrong purpose - e.g. a `since` token
       # accidentally passed here - tampered with, or simply not a token this method produced),
-      # or decrypts to something blank or longer than MAX_LENGTH characters. Never raises: this
-      # is ultimately fed by a client-controlled channel param.
+      # or decrypts to something blank or longer than MAX_LENGTH characters (see .normalize).
+      # Never raises: this is ultimately fed by a client-controlled channel param.
       def decrypt(token, encryptor)
         return nil unless token.respond_to?(:to_str)
 
@@ -46,9 +62,8 @@ class ActionCable::SubscriptionAdapter::EnhancedPostgresql
 
         value = encryptor.decrypt_and_verify(string, purpose: PURPOSE)
         return nil unless value.is_a?(String)
-        return nil if value.strip.empty? || value.length > MAX_LENGTH
 
-        value
+        normalize(value)
       rescue ActiveSupport::MessageEncryptor::InvalidMessage, ActiveSupport::MessageVerifier::InvalidSignature, ArgumentError, TypeError
         nil
       end
