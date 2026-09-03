@@ -3,7 +3,7 @@ class ActionCable::SubscriptionAdapter::EnhancedPostgresql
     initializer "action_cable.enhanced_postgresql_adapter" do
       ActiveSupport.on_load(:active_record) do
         adapter = ActionCable::SubscriptionAdapter::EnhancedPostgresql
-        ActiveRecord::SchemaDumper.ignore_tables << adapter::MESSAGES_TABLE
+        ActiveRecord::SchemaDumper.ignore_tables << adapter::BROADCASTS_TABLE
         ActiveRecord::SchemaDumper.ignore_tables << adapter::LEGACY_LARGE_PAYLOADS_TABLE
       end
 

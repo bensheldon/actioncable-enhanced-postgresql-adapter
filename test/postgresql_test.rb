@@ -24,13 +24,7 @@ class PostgresqlAdapterTest < ActionCable::TestCase
 
     # Connect to the database
     ActiveRecord::Base.establish_connection database_config
-
-    begin
-      ActiveRecord::Base.connection.connect!
-    rescue
-      @rx_adapter = @tx_adapter = nil
-      skip "Couldn't connect to PostgreSQL: #{database_config.inspect}"
-    end
+    ActiveRecord::Base.connection.connect!
 
     super
   end
@@ -91,7 +85,7 @@ class PostgresqlAdapterTest < ActionCable::TestCase
   # Postgres has a NOTIFY payload limit of 8000 bytes which requires special handling to avoid
   # "PG::InvalidParameterValue: ERROR: payload string too long" errors.
   def test_large_payload_broadcast
-    large_payloads_table = ActionCable::SubscriptionAdapter::EnhancedPostgresql::MESSAGES_TABLE
+    large_payloads_table = ActionCable::SubscriptionAdapter::EnhancedPostgresql::BROADCASTS_TABLE
     ActiveRecord::Base.connection_pool.with_connection do |connection|
       connection.execute("DROP TABLE IF EXISTS #{large_payloads_table}")
     end
@@ -115,14 +109,14 @@ class PostgresqlAdapterTest < ActionCable::TestCase
 
   def test_automatic_payload_deletion
     inserts_per_delete = ActionCable::SubscriptionAdapter::EnhancedPostgresql::INSERTS_PER_DELETE
-    large_payloads_table = ActionCable::SubscriptionAdapter::EnhancedPostgresql::MESSAGES_TABLE
+    large_payloads_table = ActionCable::SubscriptionAdapter::EnhancedPostgresql::BROADCASTS_TABLE
     large_payload = "a" * (ActionCable::SubscriptionAdapter::EnhancedPostgresql::MAX_NOTIFY_SIZE + 1)
     pg_conn = ActiveRecord::Base.connection.raw_connection
 
     # Prep the database so that we are one insert away from a delete. All but one entry should be old
     # enough to be reaped on the next broadcast.
     pg_conn.exec("DROP TABLE IF EXISTS #{large_payloads_table}")
-    pg_conn.exec(ActionCable::SubscriptionAdapter::EnhancedPostgresql::CREATE_MESSAGES_TABLE_QUERY)
+    pg_conn.exec(ActionCable::SubscriptionAdapter::EnhancedPostgresql::CREATE_BROADCASTS_TABLE_QUERY)
 
     # Insert 98 stale payloads
     (inserts_per_delete - 2).times do
@@ -149,7 +143,7 @@ class PostgresqlAdapterTest < ActionCable::TestCase
 
   # Specifying url should bypass ActiveRecord and connect directly to the provided database
   def test_explicit_url_configuration
-    large_payloads_table = ActionCable::SubscriptionAdapter::EnhancedPostgresql::MESSAGES_TABLE
+    large_payloads_table = ActionCable::SubscriptionAdapter::EnhancedPostgresql::BROADCASTS_TABLE
     explicit_database = "actioncable_enhanced_postgresql_test_explicit"
 
     ActiveRecord::Base.connection_pool.with_connection do |connection|
@@ -189,7 +183,7 @@ class PostgresqlAdapterTest < ActionCable::TestCase
       assert_equal "hello world", queue.pop
     end
 
-    assert_equal 1, ActiveRecord::Base.connection.query("SELECT COUNT(*) FROM #{ActionCable::SubscriptionAdapter::EnhancedPostgresql::MESSAGES_TABLE}").first.first
+    assert_equal 1, ActiveRecord::Base.connection.query("SELECT COUNT(*) FROM #{ActionCable::SubscriptionAdapter::EnhancedPostgresql::BROADCASTS_TABLE}").first.first
   end
 
   def test_non_reliable_broadcasting_only_stores_large_payloads
@@ -203,13 +197,13 @@ class PostgresqlAdapterTest < ActionCable::TestCase
       assert_equal "small", queue.pop
 
       # Nothing warranted storing anything yet, so the table hasn't even been created.
-      assert_nil ActiveRecord::Base.connection.select_value("SELECT to_regclass('#{ActionCable::SubscriptionAdapter::EnhancedPostgresql::MESSAGES_TABLE}')")
+      assert_nil ActiveRecord::Base.connection.select_value("SELECT to_regclass('#{ActionCable::SubscriptionAdapter::EnhancedPostgresql::BROADCASTS_TABLE}')")
 
       adapter.broadcast("channel", large_payload)
       assert_equal large_payload, queue.pop
     end
 
-    assert_equal 1, ActiveRecord::Base.connection.query("SELECT COUNT(*) FROM #{ActionCable::SubscriptionAdapter::EnhancedPostgresql::MESSAGES_TABLE}").first.first
+    assert_equal 1, ActiveRecord::Base.connection.query("SELECT COUNT(*) FROM #{ActionCable::SubscriptionAdapter::EnhancedPostgresql::BROADCASTS_TABLE}").first.first
   end
 
   def test_reliable_broadcasting_with_large_payload_stores_once_and_delivers_intact
@@ -223,7 +217,7 @@ class PostgresqlAdapterTest < ActionCable::TestCase
       assert_equal large_payload, queue.pop
     end
 
-    assert_equal 1, ActiveRecord::Base.connection.query("SELECT COUNT(*) FROM #{ActionCable::SubscriptionAdapter::EnhancedPostgresql::MESSAGES_TABLE}").first.first
+    assert_equal 1, ActiveRecord::Base.connection.query("SELECT COUNT(*) FROM #{ActionCable::SubscriptionAdapter::EnhancedPostgresql::BROADCASTS_TABLE}").first.first
   end
 
   # Regression test: large payloads used to be stored SQL-escaped (quotes/backslashes doubled)
@@ -299,21 +293,21 @@ class PostgresqlAdapterTest < ActionCable::TestCase
     inserts_per_delete = ActionCable::SubscriptionAdapter::EnhancedPostgresql::INSERTS_PER_DELETE
     pg_conn = ActiveRecord::Base.connection.raw_connection
 
-    pg_conn.exec("DROP TABLE IF EXISTS #{ActionCable::SubscriptionAdapter::EnhancedPostgresql::MESSAGES_TABLE}")
-    pg_conn.exec(ActionCable::SubscriptionAdapter::EnhancedPostgresql::CREATE_MESSAGES_TABLE_QUERY)
+    pg_conn.exec("DROP TABLE IF EXISTS #{ActionCable::SubscriptionAdapter::EnhancedPostgresql::BROADCASTS_TABLE}")
+    pg_conn.exec(ActionCable::SubscriptionAdapter::EnhancedPostgresql::CREATE_BROADCASTS_TABLE_QUERY)
 
     # With message_retention: 10, rows older than 10s are stale.
     (inserts_per_delete - 2).times do
-      pg_conn.exec("INSERT INTO #{ActionCable::SubscriptionAdapter::EnhancedPostgresql::MESSAGES_TABLE} (channel, payload, created_at) VALUES ('channel', 'a', NOW() - INTERVAL '15 seconds') RETURNING id")
+      pg_conn.exec("INSERT INTO #{ActionCable::SubscriptionAdapter::EnhancedPostgresql::BROADCASTS_TABLE} (channel, payload, created_at) VALUES ('channel', 'a', NOW() - INTERVAL '15 seconds') RETURNING id")
     end
-    new_message_id = pg_conn.exec("INSERT INTO #{ActionCable::SubscriptionAdapter::EnhancedPostgresql::MESSAGES_TABLE} (channel, payload, created_at) VALUES ('channel', 'a', NOW() - INTERVAL '5 seconds') RETURNING id").first.fetch("id")
+    new_message_id = pg_conn.exec("INSERT INTO #{ActionCable::SubscriptionAdapter::EnhancedPostgresql::BROADCASTS_TABLE} (channel, payload, created_at) VALUES ('channel', 'a', NOW() - INTERVAL '5 seconds') RETURNING id").first.fetch("id")
 
     assert_equal inserts_per_delete - 1, new_message_id
 
     adapter = build_adapter(reliable_broadcasting: true, message_retention: 10)
     adapter.broadcast("channel", "trigger deletion")
 
-    remaining_ids = pg_conn.query("SELECT id FROM #{ActionCable::SubscriptionAdapter::EnhancedPostgresql::MESSAGES_TABLE} ORDER BY id").values.flatten
+    remaining_ids = pg_conn.query("SELECT id FROM #{ActionCable::SubscriptionAdapter::EnhancedPostgresql::BROADCASTS_TABLE} ORDER BY id").values.flatten
     assert_equal [inserts_per_delete - 1, inserts_per_delete], remaining_ids
   ensure
     pg_conn&.close
@@ -347,7 +341,7 @@ class PostgresqlAdapterTest < ActionCable::TestCase
 
   def drop_messages_table
     ActiveRecord::Base.connection_pool.with_connection do |connection|
-      connection.execute("DROP TABLE IF EXISTS #{ActionCable::SubscriptionAdapter::EnhancedPostgresql::MESSAGES_TABLE}")
+      connection.execute("DROP TABLE IF EXISTS #{ActionCable::SubscriptionAdapter::EnhancedPostgresql::BROADCASTS_TABLE}")
     end
   end
 end

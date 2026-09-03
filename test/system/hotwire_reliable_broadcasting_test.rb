@@ -11,6 +11,9 @@
 
 ENV["RAILS_ENV"] ||= "test"
 
+require_relative "../support/postgres"
+PostgresSupport.ensure_available!
+
 require_relative "../dummy/config/environment"
 require "rails/test_help"
 require "capybara/cuprite"
@@ -64,12 +67,7 @@ class HotwireReliableBroadcastingTest < ActionDispatch::SystemTestCase
     end
 
     ActiveRecord::Base.establish_connection database_config
-
-    begin
-      ActiveRecord::Base.connection.connect!
-    rescue
-      skip "Couldn't connect to PostgreSQL: #{database_config.inspect}"
-    end
+    ActiveRecord::Base.connection.connect!
   end
 
   def test_broadcast_during_render_is_replayed_to_the_page
@@ -77,7 +75,12 @@ class HotwireReliableBroadcastingTest < ActionDispatch::SystemTestCase
 
     visit "/rooms/#{room_id}?broadcast_during_render=true"
 
-    assert_selector "turbo-cable-stream-source[data-since]", visible: :all
+    assert_selector "turbo-cable-stream-source[data-enhanced-since]", visible: :all
+
+    # The value is an encrypted-and-signed token, not the plain ISO 8601 timestamp - a client
+    # must not be able to read or forge it.
+    token = find("turbo-cable-stream-source", visible: :all)["data-enhanced-since"]
+    refute_match(/\A\d{4}-\d{2}-\d{2}T/, token)
 
     # Replayed: the controller broadcast this before the browser could possibly have
     # subscribed, yet it shows up once the subscription confirms and replay runs.
@@ -92,7 +95,7 @@ class HotwireReliableBroadcastingTest < ActionDispatch::SystemTestCase
 
     visit "/rooms/#{room_id}?broadcast_during_render=true&reliable=false"
 
-    assert_no_selector "turbo-cable-stream-source[data-since]", visible: :all
+    assert_no_selector "turbo-cable-stream-source[data-enhanced-since]", visible: :all
 
     # Wait for the live message first, so a lack of #message_during_render below is meaningful
     # (i.e. the subscription really is up, it just didn't replay anything).

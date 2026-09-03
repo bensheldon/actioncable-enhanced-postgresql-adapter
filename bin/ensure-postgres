@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Idempotent helper: make sure a local PostgreSQL server is up and that the current OS user
+# has a usable superuser role, starting/creating whichever of those is missing.
+#
+# Exit 0 once `pg_isready` succeeds (and, where possible, a role for the current user exists).
+# Exit 1 with a clear message if nothing worked.
+
+set -uo pipefail
+
+log() { echo "[ensure-postgres] $*" >&2; }
+
+pg_up() {
+  pg_isready >/dev/null 2>&1
+}
+
+if pg_up; then
+  log "PostgreSQL is already up"
+else
+  log "PostgreSQL is not responding, attempting to start it"
+
+  started=false
+
+  if ! $started && command -v pg_ctlcluster >/dev/null 2>&1 && [ -d /etc/postgresql ]; then
+    for version_dir in /etc/postgresql/*/; do
+      [ -d "$version_dir" ] || continue
+      version="$(basename "$version_dir")"
+      log "Trying pg_ctlcluster $version main start"
+      if pg_ctlcluster "$version" main start >/dev/null 2>&1; then
+        started=true
+        break
+      fi
+    done
+  fi
+
+  if ! $started && command -v service >/dev/null 2>&1; then
+    log "Trying service postgresql start"
+    service postgresql start >/dev/null 2>&1 && started=true
+  fi
+
+  if ! $started && command -v brew >/dev/null 2>&1; then
+    log "Trying brew services start postgresql@16"
+    brew services start postgresql@16 >/dev/null 2>&1 && started=true
+    if ! $started; then
+      log "Trying brew services start postgresql"
+      brew services start postgresql >/dev/null 2>&1 && started=true
+    fi
+  fi
+
+  # Whether or not one of the above reported success, wait for pg_isready - a start command can
+  # return before the server actually accepts connections.
+  waited=0
+  until pg_up || [ "$waited" -ge 15 ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  if ! pg_up; then
+    log "PostgreSQL could not be started. Tried pg_ctlcluster, service postgresql, and brew services."
+    log "Please start PostgreSQL manually and re-run."
+    exit 1
+  fi
+
+  log "PostgreSQL is up"
+fi
+
+# Make sure the current OS user has a usable role (this is what a plain `psql -d postgres`
+# needs to succeed with peer/trust auth).
+current_user="$(id -un)"
+
+if psql -d postgres -c 'select 1' >/dev/null 2>&1; then
+  log "Role for '$current_user' already usable"
+  exit 0
+fi
+
+log "No usable role for '$current_user' yet, attempting to create one"
+
+create_role_sql="CREATE ROLE \"$current_user\" SUPERUSER LOGIN"
+
+if [ "$current_user" = "root" ] && command -v su >/dev/null 2>&1 && su postgres -c "psql -c \"$create_role_sql\"" >/dev/null 2>&1; then
+  log "Created role '$current_user' via su postgres"
+elif psql -U postgres -c "$create_role_sql" >/dev/null 2>&1; then
+  log "Created role '$current_user' via psql -U postgres"
+else
+  log "Could not create a role for '$current_user' automatically."
+  log "Create one manually, e.g.: sudo -u postgres createuser -s $current_user"
+  exit 1
+fi
+
+if psql -d postgres -c 'select 1' >/dev/null 2>&1; then
+  log "Role for '$current_user' is now usable"
+  exit 0
+else
+  log "Role was created but is still not usable - check pg_hba.conf authentication settings"
+  exit 1
+fi

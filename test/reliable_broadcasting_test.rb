@@ -96,12 +96,7 @@ class ReliableBroadcastingChannelTest < ActionCable::TestCase
 
     # Connect to the database
     ActiveRecord::Base.establish_connection database_config
-
-    begin
-      ActiveRecord::Base.connection.connect!
-    rescue
-      skip "Couldn't connect to PostgreSQL: #{database_config.inspect}"
-    end
+    ActiveRecord::Base.connection.connect!
 
     super
   end
@@ -176,6 +171,79 @@ class ReliableBroadcastingChannelTest < ActionCable::TestCase
 
     assert_confirmation(connection)
     connection.assert_no_more_transmissions
+    assert_match(/invalid or forged/, connection.log_io.string)
+  end
+
+  # A plain ISO 8601 timestamp used to be exactly what this param expected - now that it's
+  # encrypted, one is just another kind of garbage/forged input and must not be accepted as-is.
+  def test_plain_unencrypted_timestamp_since_param_is_rejected
+    server = build_server
+    room = unique_room
+    server.pubsub.broadcast(room, {"text" => "before"}.to_json)
+    sleep 0.05
+
+    connection, channel = build_channel(server, room: room, since: ReliableBroadcasting.format_timestamp(Time.now.utc))
+    channel.subscribe_to_channel
+
+    assert_confirmation(connection)
+    connection.assert_no_more_transmissions
+    assert_match(/invalid or forged/, connection.log_io.string)
+  end
+
+  # A token encrypted with a different secret (e.g. a forged/spoofed value, or one left over from
+  # a previous secret_key_base) must not verify.
+  def test_since_token_encrypted_with_a_different_secret_is_rejected
+    server = build_server
+    room = unique_room
+    server.pubsub.broadcast(room, {"text" => "before"}.to_json)
+    sleep 0.05
+
+    forged_encryptor = ActiveSupport::MessageEncryptor.new(SecureRandom.random_bytes(32))
+    forged_token = ReliableBroadcasting.encrypt_since(Time.now.utc, forged_encryptor)
+
+    connection, channel = build_channel(server, room: room, since: forged_token)
+    channel.subscribe_to_channel
+
+    assert_confirmation(connection)
+    connection.assert_no_more_transmissions
+    assert_match(/invalid or forged/, connection.log_io.string)
+  end
+
+  # turbo-rails forwards a `data-enhanced-since` attribute as the channel param `enhanced_since`
+  # (see ReliableBroadcasting::SINCE_PARAM_ALTERNATIVES) - accept that spelling too.
+  def test_enhanced_since_underscore_alternative_param_name_is_accepted
+    server = build_server
+    room = unique_room
+    since = Time.now.utc
+
+    server.pubsub.broadcast(room, {"text" => "first"}.to_json)
+    sleep 0.05
+
+    connection, channel = build_channel(server, room: room, since: since, param_name: "enhanced_since")
+    channel.subscribe_to_channel
+
+    assert_confirmation(connection)
+    assert_equal({"text" => "first"}, connection.pop_transmission[:message])
+  end
+
+  # Channel params are normally a HashWithIndifferentAccess already (see #build_channel), but the
+  # concern is defensive about looking the param up under a symbol key too.
+  def test_since_param_as_a_symbol_key_is_accepted
+    server = build_server
+    room = unique_room
+    since = Time.now.utc
+    token = ReliableBroadcasting.encrypt_since(since, server.pubsub.payload_encryptor)
+
+    server.pubsub.broadcast(room, {"text" => "first"}.to_json)
+    sleep 0.05
+
+    connection = FakeConnection.new(server)
+    params = {room: room, ReliableBroadcasting::SINCE_PARAM.to_sym => token}
+    channel = ReplayTestChannel.new(connection, '{"channel":"ReplayTestChannel"}', params)
+    channel.subscribe_to_channel
+
+    assert_confirmation(connection)
+    assert_equal({"text" => "first"}, connection.pop_transmission[:message])
   end
 
   def test_reliable_broadcasting_disabled_on_adapter_only_delivers_confirmation_and_warns
@@ -223,11 +291,15 @@ class ReliableBroadcastingChannelTest < ActionCable::TestCase
     server
   end
 
-  def build_channel(server, room:, since: :none)
+  def build_channel(server, room:, since: :none, param_name: ReliableBroadcasting::SINCE_PARAM)
     connection = FakeConnection.new(server)
     params = {"room" => room}
     if since != :none
-      params["since"] = since.is_a?(Time) ? ReliableBroadcasting.format_timestamp(since) : since
+      # A Time is encrypted into a real token with the adapter's own payload_encryptor, exactly
+      # like ReliableBroadcasting::Helper#action_cable_enhanced_since_param would produce; a
+      # String is used as-is, to simulate a garbage/forged/unencrypted value arriving as the
+      # param.
+      params[param_name] = since.is_a?(Time) ? ReliableBroadcasting.encrypt_since(since, server.pubsub.payload_encryptor) : since
     end
     # ActionCable normally parses subscription params from a JSON identifier via
     # ActiveSupport::JSON.decode(...).with_indifferent_access (see
@@ -263,42 +335,65 @@ end
 class ReliableBroadcastingHelperTest < ActionCable::TestCase
   StubController = Struct.new(:action_cable_since)
 
-  def test_meta_tag_renders_the_controllers_captured_time
+  def test_meta_tag_renders_an_encrypted_token_of_the_controllers_captured_time
     controller_time = Time.now.utc
-    view = build_view(StubController.new(controller_time))
+    encryptor = build_encryptor
+    view = build_view(StubController.new(controller_time), encryptor)
 
-    tag = view.action_cable_since_meta_tag
+    tag = view.action_cable_enhanced_since_meta_tag
 
-    assert_match(/\A<meta name="action-cable-since" content="[^"]+"\s*\/?>\z/, tag)
+    assert_match(/\A<meta name="action-cable-enhanced-since" content="[^"]+"\s*\/?>\z/, tag)
     content = tag[/content="([^"]+)"/, 1]
-    parsed = ReliableBroadcasting.parse_timestamp(content)
+
+    # Not the plain ISO 8601 string a client could read or forge - see the "Security" section
+    # of the README.
+    refute_match(/\A\d{4}-\d{2}-\d{2}T/, content)
+
+    parsed = ReliableBroadcasting.decrypt_since(content, encryptor)
 
     refute_nil parsed
     assert_in_delta controller_time.to_f, parsed.to_f, 0.000002
   end
 
   def test_meta_tag_falls_back_to_now_without_a_controller_method
+    encryptor = build_encryptor
     view = ActionView::Base.empty
     view.singleton_class.include(ActionCable::SubscriptionAdapter::EnhancedPostgresql::ReliableBroadcasting::Helper)
+    view.define_singleton_method(:action_cable_param_encryptor) { encryptor }
 
     before = Time.now.utc
-    tag = view.action_cable_since_meta_tag
+    tag = view.action_cable_enhanced_since_meta_tag
     after = Time.now.utc
 
     content = tag[/content="([^"]+)"/, 1]
-    parsed = ReliableBroadcasting.parse_timestamp(content)
+    parsed = ReliableBroadcasting.decrypt_since(content, encryptor)
 
     refute_nil parsed
     assert_operator parsed, :>=, before
     assert_operator parsed, :<=, after
   end
 
+  def test_action_cable_param_encryptor_raises_a_clear_error_without_the_enhanced_adapter
+    view = ActionView::Base.empty
+    view.singleton_class.include(ActionCable::SubscriptionAdapter::EnhancedPostgresql::ReliableBroadcasting::Helper)
+
+    # ActionCable.server.pubsub is the "test" adapter here (see test_helper.rb), which has no
+    # #payload_encryptor - i.e. the app isn't using the enhanced_postgresql adapter.
+    error = assert_raises(RuntimeError) { view.action_cable_enhanced_since_param }
+    assert_match(/payload_encryptor|enhanced_postgresql/, error.message)
+  end
+
   private
 
-  def build_view(stub_controller)
+  def build_encryptor
+    ActiveSupport::MessageEncryptor.new(SecureRandom.random_bytes(32))
+  end
+
+  def build_view(stub_controller, encryptor)
     view = ActionView::Base.empty
     view.singleton_class.include(ActionCable::SubscriptionAdapter::EnhancedPostgresql::ReliableBroadcasting::Helper)
     view.define_singleton_method(:controller) { stub_controller }
+    view.define_singleton_method(:action_cable_param_encryptor) { encryptor }
     view
   end
 end
@@ -322,6 +417,49 @@ class ReliableBroadcastingTimestampTest < ActionCable::TestCase
     assert_nil ReliableBroadcasting.parse_timestamp("")
     assert_nil ReliableBroadcasting.parse_timestamp("yesterday")
     assert_nil ReliableBroadcasting.parse_timestamp(42)
+  end
+
+  def test_encrypt_and_decrypt_since_round_trip
+    time = Time.now.utc
+    encryptor = ActiveSupport::MessageEncryptor.new(SecureRandom.random_bytes(32))
+
+    token = ReliableBroadcasting.encrypt_since(time, encryptor)
+
+    refute_match(/\A\d{4}-\d{2}-\d{2}T/, token)
+    assert_in_delta time.to_f, ReliableBroadcasting.decrypt_since(token, encryptor).to_f, 0.000002
+  end
+
+  def test_decrypt_since_returns_nil_for_nil_blank_or_garbage_tokens
+    encryptor = ActiveSupport::MessageEncryptor.new(SecureRandom.random_bytes(32))
+
+    assert_nil ReliableBroadcasting.decrypt_since(nil, encryptor)
+    assert_nil ReliableBroadcasting.decrypt_since("", encryptor)
+    assert_nil ReliableBroadcasting.decrypt_since("garbage", encryptor)
+    assert_nil ReliableBroadcasting.decrypt_since(ReliableBroadcasting.format_timestamp(Time.now.utc), encryptor)
+  end
+
+  def test_decrypt_since_returns_nil_for_a_token_encrypted_with_a_different_secret
+    time = Time.now.utc
+    token = ReliableBroadcasting.encrypt_since(time, ActiveSupport::MessageEncryptor.new(SecureRandom.random_bytes(32)))
+
+    other_encryptor = ActiveSupport::MessageEncryptor.new(SecureRandom.random_bytes(32))
+    assert_nil ReliableBroadcasting.decrypt_since(token, other_encryptor)
+  end
+
+  def test_decrypt_since_returns_nil_for_a_token_encrypted_with_a_different_purpose
+    time = Time.now.utc
+    encryptor = ActiveSupport::MessageEncryptor.new(SecureRandom.random_bytes(32))
+    token = encryptor.encrypt_and_sign(ReliableBroadcasting.format_timestamp(time), purpose: "some-other-purpose")
+
+    assert_nil ReliableBroadcasting.decrypt_since(token, encryptor)
+  end
+
+  def test_since_param_token_accepts_the_primary_name_the_alternative_name_and_symbol_keys
+    assert_equal "x", ReliableBroadcasting.since_param_token({"enhanced-since" => "x"})
+    assert_equal "x", ReliableBroadcasting.since_param_token({enhanced_since: "x"})
+    assert_equal "x", ReliableBroadcasting.since_param_token({"enhanced_since" => "x"})
+    assert_nil ReliableBroadcasting.since_param_token({"since" => "x"})
+    assert_nil ReliableBroadcasting.since_param_token({})
   end
 end
 

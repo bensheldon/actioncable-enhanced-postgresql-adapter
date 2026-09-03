@@ -14,6 +14,9 @@ require "active_support/testing/method_call_assertions"
 require "minitest/reporters"
 Minitest::Reporters.use!
 
+require_relative "support/postgres"
+PostgresSupport.ensure_available!
+
 # Set test adapter and logger
 ActionCable.server.config.cable = { "adapter" => "test" }
 ActionCable.server.config.logger = Logger.new(nil)

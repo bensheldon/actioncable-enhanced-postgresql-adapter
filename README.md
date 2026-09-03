@@ -7,7 +7,7 @@ This gem provides an enhanced PostgreSQL adapter for ActionCable. It is based on
 
 ### Approach
 
-To overcome the 8000 bytes limit, we temporarily store large payloads in an [unlogged](https://www.crunchydata.com/blog/postgresl-unlogged-tables) database table named `action_cable_messages`. The table is lazily created on first broadcast.
+To overcome the 8000 bytes limit, we temporarily store large payloads in an [unlogged](https://www.crunchydata.com/blog/postgresl-unlogged-tables) database table named `action_cable_enhanced_broadcasts`. The table is lazily created on first broadcast.
 
 We then broadcast a payload in the style of `__large_payload:<encrypted-payload-id>`. The listener client then decrypts incoming ID's, fetches the original payload from the database, and replaces the temporary payload before invoking the subscriber callback.
 
@@ -57,24 +57,24 @@ Note that whichever ActionCable adapter you're using, sending large payloads wit
 
 ### Cleanup of stored messages
 
-Deletion of stale messages (`message_retention` seconds old or older, 120 by default) is triggered every 100 inserts into `action_cable_messages`. We do this by looking at the incremental ID generated on insert and checking if it is evenly divisible by 100. This approach avoids having to manually schedule cleanup jobs while striking a balance between performance and cleanup frequency.
+Deletion of stale messages (`message_retention` seconds old or older, 120 by default) is triggered every 100 inserts into `action_cable_enhanced_broadcasts`. We do this by looking at the incremental ID generated on insert and checking if it is evenly divisible by 100. This approach avoids having to manually schedule cleanup jobs while striking a balance between performance and cleanup frequency.
 
 ## Reliable broadcasting
 
 Normally, a broadcast is only delivered to clients that are already subscribed at the moment it happens. That leaves a gap: a page is rendered by a controller, sent to the browser, and only then does the client's WebSocket connect and subscribe to a channel. Anything broadcast while the page is rendering, or in the time between the response arriving and the subscription being confirmed, is lost. The same gap reopens on every reconnect.
 
-Setting `reliable_broadcasting: true` in `cable.yml` closes that gap. When it's enabled, every broadcast payload is stored in the `action_cable_messages` table (not only ones over 8000 bytes), and the adapter exposes a `messages_since` API that a channel can use to replay anything it missed, right after its subscription is confirmed.
+Setting `reliable_broadcasting: true` in `cable.yml` closes that gap. When it's enabled, every broadcast payload is stored in the `action_cable_enhanced_broadcasts` table (not only ones over 8000 bytes), and the adapter exposes a `messages_since` API that a channel can use to replay anything it missed, right after its subscription is confirmed.
 
 The flow looks like this:
 
 1. A controller records the current time (`Time.now.utc`) before the action runs.
-2. A view helper embeds that timestamp in the rendered HTML, either as a meta tag or a data attribute.
-3. The client passes it back as the `since` channel parameter when it subscribes.
-4. Once the channel's subscription to Postgres (`LISTEN`) is confirmed, the server looks up every message stored for that stream with a `created_at` at or after `since`, and delivers them through the normal stream handler, oldest first. Live messages that arrive while the replay runs are delivered as usual.
+2. A view helper encrypts that timestamp and embeds the resulting token in the rendered HTML, either as a meta tag or a data attribute.
+3. The client passes it back as the `enhanced-since` channel parameter when it subscribes.
+4. Once the channel's subscription to Postgres (`LISTEN`) is confirmed, the server decrypts the token back into a timestamp and looks up every message stored for that stream with a `created_at` at or after it, delivering them through the normal stream handler, oldest first. Live messages that arrive while the replay runs are delivered as usual.
 
 ### Integrating into a Rails app
 
-There are three moving parts: the adapter has to store messages (`cable.yml`), your channel has to replay them (the `Channel` concern), and the page has to hand the render timestamp back to the channel (a helper in the view plus the `since` channel parameter). Controllers and views need no manual wiring in a Rails app: the gem's Railtie includes the `Controller` concern into `ActionController::Base` and registers the `Helper` module for all views.
+There are three moving parts: the adapter has to store messages (`cable.yml`), your channel has to replay them (the `Channel` concern), and the page has to hand the render timestamp back to the channel (a helper in the view plus the `enhanced-since` channel parameter). Controllers and views need no manual wiring in a Rails app: the gem's Railtie includes the `Controller` concern into `ActionController::Base` and registers the `Helper` module for all views.
 
 Two complete walkthroughs follow, one for a hand-written Action Cable channel and one for Hotwire Turbo Streams. Step 1 is shared.
 
@@ -92,11 +92,11 @@ production:
   message_retention: 120 # seconds, optional, this is the default
 ```
 
-Restart the server. The `action_cable_messages` table is created on the first broadcast, no migration needed.
+Restart the server. The `action_cable_enhanced_broadcasts` table is created on the first broadcast, no migration needed.
 
 #### Option A: a plain Action Cable channel
 
-Include the concern once in your base channel so every channel replays missed messages when a `since` parameter is present:
+Include the concern once in your base channel so every channel replays missed messages when an `enhanced-since` parameter is present:
 
 ```ruby
 # app/channels/application_cable/channel.rb
@@ -125,14 +125,14 @@ Render the timestamp into the page. Put the meta tag in the `<head>` next to `ac
 <%# app/views/layouts/application.html.erb %>
 <head>
   <%= action_cable_meta_tag %>
-  <%= action_cable_since_meta_tag %>
+  <%= action_cable_enhanced_since_meta_tag %>
   <%= javascript_importmap_tags %>
 </head>
 ```
 
-This renders `<meta name="action-cable-since" content="2026-09-02T18:55:12.123456Z">`. The value is captured by a `prepend_before_action` at the very start of the request, so any broadcast that happens while your action queries the database or renders its templates is covered.
+This renders `<meta name="action-cable-enhanced-since" content="...">`, where the content is an encrypted-and-signed token, not the timestamp itself - see [Security](#security) below. It's captured by a `prepend_before_action` at the very start of the request, so any broadcast that happens while your action queries the database or renders its templates is covered.
 
-Pass it along when the JavaScript subscribes. `ActionCable.getConfig("since")` reads the meta tag for you:
+Pass it along when the JavaScript subscribes. `ActionCable.getConfig("enhanced-since")` reads the meta tag for you:
 
 ```js
 // app/javascript/channels/chat_channel.js
@@ -141,7 +141,7 @@ import * as ActionCable from "@rails/actioncable"
 const consumer = ActionCable.createConsumer()
 
 consumer.subscriptions.create(
-  { channel: "ChatChannel", room_id: 1, since: ActionCable.getConfig("since") },
+  { channel: "ChatChannel", room_id: 1, "enhanced-since": ActionCable.getConfig("enhanced-since") },
   {
     received(data) {
       // May be called more than once for the same message (see Caveats), so keep this idempotent,
@@ -181,11 +181,11 @@ Rails.application.config.to_prepare do
 end
 ```
 
-Then pass the timestamp wherever you call `turbo_stream_from`. turbo-rails forwards the `data-*` attributes of the rendered `<turbo-cable-stream-source>` element as channel parameters, so a `data-since` attribute arrives at the channel as `params[:since]`, the same as it would for a hand-written subscription:
+Then pass the token wherever you call `turbo_stream_from`. turbo-rails forwards the `data-*` attributes of the rendered `<turbo-cable-stream-source>` element as channel parameters, dasherizing the attribute name on the way out and snake\_casing it back on the way in, so a `data: { enhanced_since: ... }` attribute renders as `data-enhanced-since` and arrives at the channel as `params[:enhanced_since]` - which is exactly why the `Channel` concern accepts both that and the primary `enhanced-since` spelling:
 
 ```erb
 <%# app/views/rooms/show.html.erb %>
-<%= turbo_stream_from @room, data: { since: action_cable_since_param } %>
+<%= turbo_stream_from @room, data: { enhanced_since: action_cable_enhanced_since_param } %>
 
 <h1><%= @room.name %></h1>
 <div id="messages">
@@ -205,11 +205,11 @@ end
 
 `broadcasts_to` uses `append` for creates and `replace` for updates, both keyed on the element's DOM id, so a replayed message that already made it into the rendered page is harmless: Turbo replaces the existing element rather than adding a second one.
 
-If you render several `turbo_stream_from` tags on one page, pass `data: { since: action_cable_since_param }` to each of them. Every one is its own subscription and each is replayed independently.
+If you render several `turbo_stream_from` tags on one page, pass `data: { enhanced_since: action_cable_enhanced_since_param }` to each of them. Every one is its own subscription and each is replayed independently.
 
 #### Checking that it works
 
-1. Open a page that subscribes to a channel and confirm the rendered HTML contains the timestamp (`action-cable-since` meta tag or a `data-since` attribute).
+1. Open a page that subscribes to a channel and confirm the rendered HTML contains the token (`action-cable-enhanced-since` meta tag or a `data-enhanced-since` attribute) - and that it is *not* a readable timestamp.
 2. In the Rails log for the WebSocket connection you should see `ChatChannel is streaming from ...` followed by `ChatChannel replayed N message(s) from ... since ...` whenever there was something to catch up on.
 3. To reproduce the race on purpose, add `sleep 5` to the controller action, load the page, and broadcast to the stream from a Rails console during those five seconds. The broadcast shows up in the browser as soon as the page connects.
 
@@ -224,7 +224,11 @@ class ApplicationController < ActionController::API
 end
 ```
 
-The controller concern adds `action_cable_since` (a UTC `Time`, captured before the action) and the helper adds `action_cable_since_param` (that time as an ISO 8601 string) and `action_cable_since_meta_tag`.
+The controller concern adds `action_cable_since` (a UTC `Time`, captured before the action) and the helper adds `action_cable_enhanced_since_param` (that time as an encrypted token) and `action_cable_enhanced_since_meta_tag`.
+
+### Security
+
+The `enhanced-since` value sent to the browser is never the plain timestamp - it's an [`ActiveSupport::MessageEncryptor`](https://api.rubyonrails.org/classes/ActiveSupport/MessageEncryptor.html) token, encrypted and signed with the adapter's own `payload_encryptor` (see [Configuration](#configuration)) under the purpose `"enhanced-since"`. A client can read the token back on later requests but can't decrypt it, tamper with it, or forge one of their own to fish for messages from an arbitrary point in time. On the way back in, the channel decrypts and verifies it the same way; anything that fails to decrypt or verify - a missing/invalid signature, a mismatched purpose, or simply garbage - is treated exactly like a missing param (no replay, just the subscription confirmation) and logged as a warning, never raised.
 
 ### `messages_since`
 
@@ -244,12 +248,13 @@ It returns `[]` if nothing has been stored for that channel, or if `reliable_bro
 - **Delivery is at-least-once, not exactly-once.** A message broadcast in the small window between the subscription's `LISTEN` becoming active and the replay query running can be delivered twice: once live, once replayed. A reconnect also replays the entire retained window again using the original `since` value, which is exactly what makes reconnects reliable, but it means handlers need to be idempotent. Turbo Streams' `replace` and `update` actions are idempotent by nature, and so are `append` / `prepend` of elements that carry an `id`, since Turbo will not insert a duplicate.
 - **Replay is bounded by `message_retention`.** Only messages younger than `message_retention` seconds (120 by default) are guaranteed to still be in the table. A `since` timestamp older than that will only get back whatever hasn't been cleaned up yet.
 - **Clocks must be in sync.** The `since` timestamp is captured on the Rails server, but compared against `created_at` timestamps generated by the database clock. Keep both clocks synchronized (NTP) or the comparison can miss messages or replay too much.
-- **There's a performance cost.** With `reliable_broadcasting` enabled, every broadcast does one extra INSERT into `action_cable_messages` in addition to the NOTIFY. See [Performance](#performance).
+- **There's a performance cost.** With `reliable_broadcasting` enabled, every broadcast does one extra INSERT into `action_cable_enhanced_broadcasts` in addition to the NOTIFY. See [Performance](#performance).
 
 ## Development
 
 - Clone repo
 - `bundle install` to install dependencies
+- The test suite needs a real, reachable PostgreSQL server - it does not skip when one isn't available, it fails. `bin/ensure-postgres` starts a local server if one isn't already running (and creates a superuser role for the current OS user if needed); every test file calls it automatically before connecting, so in the common case you don't need to run it yourself. If it can't find a way to start Postgres on your system, run it directly to see why, or start Postgres yourself.
 - `bundle exec ruby test/postgresql_test.rb` to run the adapter tests
 - `bundle exec ruby test/reliable_broadcasting_test.rb` to run the reliable broadcasting integration tests
 - `bundle exec ruby test/system/hotwire_reliable_broadcasting_test.rb` to run the Hotwire Turbo Streams system test - it boots a minimal Rails app under `test/dummy` and drives it with a real, headless Chromium via Capybara/Cuprite; set `BROWSER_PATH` if Chromium isn't auto-detected
