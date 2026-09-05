@@ -11,11 +11,11 @@ require "securerandom"
 require "json"
 require "stringio"
 require "timeout"
+require "minitest/mock"
 
 require "action_cable/subscription_adapter/enhanced_postgresql"
 
-ReliableBroadcasting = ActionCable::SubscriptionAdapter::EnhancedPostgresql::ReliableBroadcasting
-Presence = ActionCable::SubscriptionAdapter::EnhancedPostgresql::Presence
+EnhancedPostgresql = ActionCable::SubscriptionAdapter::EnhancedPostgresql
 
 # A minimal stand-in for ActionCable::Connection::Base, exposing just what
 # ActionCable::Channel::Base / Streams / our concern touch: #server (for its #pubsub, #worker_pool
@@ -28,8 +28,9 @@ end
 class FakeConnection
   attr_reader :server, :identifiers, :config, :subscriptions, :logger, :log_io
   # A stand-in for whatever a real app's connection would expose via `identified_by` (e.g.
-  # `current_user`) - used by PresenceOverrideTestChannel below to demonstrate a channel
-  # computing its own presence value in Ruby instead of trusting the frontend-supplied param.
+  # `current_user`) - used by the presence_identity test channels below to demonstrate a
+  # `presence_identity` serializer computing its value in Ruby instead of trusting the
+  # frontend-supplied param.
   attr_accessor :current_user_name
 
   def initialize(server)
@@ -69,7 +70,7 @@ class FakeConnection
 end
 
 class ReplayTestChannel < ActionCable::Channel::Base
-  include ActionCable::SubscriptionAdapter::EnhancedPostgresql::ReliableBroadcasting::Channel
+  include ActionCable::SubscriptionAdapter::EnhancedPostgresql::Channel
 
   def subscribed
     stream_from params[:room]
@@ -77,30 +78,57 @@ class ReplayTestChannel < ActionCable::Channel::Base
 end
 
 class PresenceTestChannel < ActionCable::Channel::Base
-  include ActionCable::SubscriptionAdapter::EnhancedPostgresql::ReliableBroadcasting::Channel
-  include ActionCable::SubscriptionAdapter::EnhancedPostgresql::Presence::Channel
+  include ActionCable::SubscriptionAdapter::EnhancedPostgresql::Channel
 
   def subscribed
     stream_from params[:room]
   end
 end
 
-# Demonstrates (and lets tests verify) a channel computing its own presence value in Ruby - e.g.
-# from `current_user` in a real app - instead of trusting the `enhanced-presence` frontend param.
-# #enhanced_presence_call_count lets tests assert the override runs at most once per subscription
-# no matter how many streams it's touching or how many heartbeats go by (see
-# Presence::Channel#resolved_enhanced_presence).
-class PresenceOverrideTestChannel < PresenceTestChannel
-  attr_accessor :enhanced_presence_call_count
+# Declares `presence_identity serialize: ...` to compute its presence value in Ruby - e.g. from
+# `current_user` in a real app - instead of trusting the `enhanced-presence` frontend param.
+# #presence_identity_call_count lets tests assert the serializer runs at most once per
+# subscription no matter how many streams it's touching or how many heartbeats go by.
+class PresenceIdentityTestChannel < PresenceTestChannel
+  attr_accessor :presence_identity_call_count
 
-  def enhanced_presence
-    self.enhanced_presence_call_count = (enhanced_presence_call_count || 0) + 1
+  presence_identity serialize: -> {
+    self.presence_identity_call_count = (presence_identity_call_count || 0) + 1
+    connection.current_user_name
+  }
+end
+
+# A subclass declaring its own serializer must not affect PresenceIdentityTestChannel above -
+# class_attribute gives each class its own, independently overridable value.
+class PresenceIdentitySubclassTestChannel < PresenceIdentityTestChannel
+  presence_identity serialize: -> { "subclass-#{connection.current_user_name}" }
+end
+
+class PresenceIdentityNilTestChannel < PresenceTestChannel
+  presence_identity serialize: -> { nil }
+end
+
+class PresenceIdentitySymbolTestChannel < PresenceTestChannel
+  presence_identity serialize: :symbol_presence_identity
+
+  def symbol_presence_identity
     connection.current_user_name
   end
 end
 
+# Any object responding to #call (not just a Proc) is accepted, called with the channel itself.
+class CallablePresenceIdentity
+  def self.call(channel)
+    channel.connection.current_user_name
+  end
+end
+
+class PresenceIdentityCallableTestChannel < PresenceTestChannel
+  presence_identity serialize: CallablePresenceIdentity
+end
+
 class ReplayTestController < ActionController::Base
-  include ActionCable::SubscriptionAdapter::EnhancedPostgresql::ReliableBroadcasting::Controller
+  include ActionCable::SubscriptionAdapter::EnhancedPostgresql::Controller
 
   def index
     sleep 0.01
@@ -202,13 +230,13 @@ class ReliableBroadcastingChannelTest < ActionCable::TestCase
     assert_match(/invalid/, connection.log_io.string)
   end
 
-  # `enhanced-since` is a plain ISO 8601 UTC timestamp - see ReliableBroadcasting.format_timestamp
+  # `enhanced-since` is a plain ISO 8601 UTC timestamp - see EnhancedPostgresql.format_timestamp
   # - not an encrypted token: it's not secret, it only ever selects a window of messages the
   # subscriber is already authorized to receive, and the server clamps it to message_retention
   # regardless of what value it's given (see EnhancedPostgresql#messages_since). Passing the raw
   # formatted string directly (rather than going through build_channel's Time-based helper below)
-  # confirms the channel accepts exactly what ReliableBroadcasting.format_timestamp /
-  # ReliableBroadcasting::Helper#action_cable_enhanced_since_param produce, with no encryption
+  # confirms the channel accepts exactly what EnhancedPostgresql.format_timestamp /
+  # EnhancedPostgresql::Helper#action_cable_enhanced_since_param produce, with no encryption
   # step in between.
   def test_plain_iso8601_timestamp_since_param_triggers_replay
     server = build_server
@@ -218,7 +246,7 @@ class ReliableBroadcastingChannelTest < ActionCable::TestCase
     server.pubsub.broadcast(room, {"text" => "first"}.to_json)
     sleep 0.05
 
-    connection, channel = build_channel(server, room: room, since: ReliableBroadcasting.format_timestamp(since))
+    connection, channel = build_channel(server, room: room, since: EnhancedPostgresql.format_timestamp(since))
     channel.subscribe_to_channel
 
     assert_confirmation(connection)
@@ -226,7 +254,7 @@ class ReliableBroadcastingChannelTest < ActionCable::TestCase
   end
 
   # turbo-rails forwards a `data-enhanced-since` attribute as the channel param `enhanced_since`
-  # (see ReliableBroadcasting::SINCE_PARAM_ALTERNATIVES) - accept that spelling too.
+  # (see EnhancedPostgresql::SINCE_PARAM_ALTERNATIVES) - accept that spelling too.
   def test_enhanced_since_underscore_alternative_param_name_is_accepted
     server = build_server
     room = unique_room
@@ -253,7 +281,7 @@ class ReliableBroadcastingChannelTest < ActionCable::TestCase
     sleep 0.05
 
     connection = FakeConnection.new(server)
-    params = {room: room, ReliableBroadcasting::SINCE_PARAM.to_sym => ReliableBroadcasting.format_timestamp(since)}
+    params = {room: room, EnhancedPostgresql::SINCE_PARAM.to_sym => EnhancedPostgresql.format_timestamp(since)}
     channel = ReplayTestChannel.new(connection, '{"channel":"ReplayTestChannel"}', params)
     channel.subscribe_to_channel
 
@@ -282,9 +310,9 @@ class ReliableBroadcastingChannelTest < ActionCable::TestCase
     channel.subscribe_to_channel
     assert_confirmation(connection)
 
-    assert channel.send(:reliable_broadcasting_handlers).key?(room)
+    assert channel.send(:enhanced_handlers).key?(room)
     channel.stop_stream_from(room)
-    assert_not channel.send(:reliable_broadcasting_handlers).key?(room)
+    assert_not channel.send(:enhanced_handlers).key?(room)
   end
 
   # ActionCable's stop_stream_from / stop_all_streams are public; the concern must not make them private.
@@ -306,14 +334,14 @@ class ReliableBroadcastingChannelTest < ActionCable::TestCase
     server
   end
 
-  def build_channel(server, room:, since: :none, param_name: ReliableBroadcasting::SINCE_PARAM)
+  def build_channel(server, room:, since: :none, param_name: EnhancedPostgresql::SINCE_PARAM)
     connection = FakeConnection.new(server)
     params = {"room" => room}
     if since != :none
       # A Time is formatted into a plain ISO 8601 string, exactly like
-      # ReliableBroadcasting::Helper#action_cable_enhanced_since_param would produce; a String is
+      # EnhancedPostgresql::Helper#action_cable_enhanced_since_param would produce; a String is
       # used as-is, to simulate a garbage value arriving as the param.
-      params[param_name] = since.is_a?(Time) ? ReliableBroadcasting.format_timestamp(since) : since
+      params[param_name] = since.is_a?(Time) ? EnhancedPostgresql.format_timestamp(since) : since
     end
     # ActionCable normally parses subscription params from a JSON identifier via
     # ActiveSupport::JSON.decode(...).with_indifferent_access (see
@@ -351,200 +379,186 @@ class ReliableBroadcastingHelperTest < ActionCable::TestCase
 
   def test_since_param_renders_a_plain_iso8601_timestamp_of_the_controllers_captured_time
     controller_time = Time.now.utc
-    encryptor = build_encryptor
-    view = build_view(StubController.new(controller_time), encryptor)
+    view = build_view(StubController.new(controller_time))
 
     param = view.action_cable_enhanced_since_param
 
     # A plain, readable ISO 8601 timestamp - not secret, and not encrypted - see the "Security"
     # section of the README: it only ever selects a window of already-authorized messages, and
     # the server clamps it to message_retention regardless of what value it's given.
-    assert_equal ReliableBroadcasting.format_timestamp(controller_time), param
+    assert_equal EnhancedPostgresql.format_timestamp(controller_time), param
 
-    parsed = ReliableBroadcasting.parse_timestamp(param)
+    parsed = EnhancedPostgresql.parse_timestamp(param)
     refute_nil parsed
     assert_in_delta controller_time.to_f, parsed.to_f, 0.000002
   end
 
   def test_since_param_falls_back_to_now_without_a_controller_method
-    encryptor = build_encryptor
     view = ActionView::Base.empty
-    view.singleton_class.include(ActionCable::SubscriptionAdapter::EnhancedPostgresql::ReliableBroadcasting::Helper)
-    view.define_singleton_method(:action_cable_param_encryptor) { encryptor }
+    view.singleton_class.include(ActionCable::SubscriptionAdapter::EnhancedPostgresql::Helper)
 
     before = Time.now.utc
     param = view.action_cable_enhanced_since_param
     after = Time.now.utc
 
-    parsed = ReliableBroadcasting.parse_timestamp(param)
+    parsed = EnhancedPostgresql.parse_timestamp(param)
 
     refute_nil parsed
     assert_operator parsed, :>=, before
     assert_operator parsed, :<=, after
   end
 
-  # action_cable_enhanced_since_param never touches #action_cable_param_encryptor (it's a plain
-  # timestamp, not encrypted) - only action_cable_enhanced_presence_param still needs it, so
-  # that's what should raise without the enhanced_postgresql adapter.
-  def test_action_cable_param_encryptor_raises_a_clear_error_without_the_enhanced_adapter
+  def test_action_cable_enhanced_presence_param_raises_a_clear_error_without_the_enhanced_adapter
     view = ActionView::Base.empty
-    view.singleton_class.include(ActionCable::SubscriptionAdapter::EnhancedPostgresql::ReliableBroadcasting::Helper)
+    view.singleton_class.include(ActionCable::SubscriptionAdapter::EnhancedPostgresql::Helper)
 
     # ActionCable.server.pubsub is the "test" adapter here (see test_helper.rb), which has no
-    # #payload_encryptor - i.e. the app isn't using the enhanced_postgresql adapter.
+    # #encrypt_presence - i.e. the app isn't using the enhanced_postgresql adapter.
     error = assert_raises(RuntimeError) { view.action_cable_enhanced_presence_param("alice") }
-    assert_match(/payload_encryptor|enhanced_postgresql/, error.message)
+    assert_match(/enhanced_postgresql/, error.message)
   end
 
   def test_enhanced_presence_param_renders_an_encrypted_token_of_the_given_value
-    encryptor = build_encryptor
-    view = build_view(StubController.new(Time.now.utc), encryptor)
+    adapter = build_presence_adapter
+    view = build_view(StubController.new(Time.now.utc))
 
-    token = view.action_cable_enhanced_presence_param("alice")
+    ActionCable.server.stub(:pubsub, adapter) do
+      token = view.action_cable_enhanced_presence_param("alice")
 
-    # Not the plain value a client could read or forge - see the "Security" section of the
-    # README.
-    refute_equal "alice", token
-
-    assert_equal "alice", Presence.decrypt(token, encryptor)
+      # Not the plain value a client could read or forge - see the "Security" section of the
+      # README.
+      refute_equal "alice", token
+      assert_equal "alice", adapter.decrypt_presence(token)
+    end
   end
 
   private
 
-  def build_encryptor
-    ActiveSupport::MessageEncryptor.new(SecureRandom.random_bytes(32))
+  def build_presence_adapter
+    server = ActionCable::Server::Base.new(config: ActionCable::Server::Configuration.new)
+    server.config.cable = {adapter: "enhanced_postgresql", payload_encryptor_secret: SecureRandom.hex(16)}.with_indifferent_access
+    server.config.logger = Logger.new(StringIO.new).tap { |l| l.level = Logger::UNKNOWN }
+    server.config.pubsub_adapter.new(server)
   end
 
-  def build_view(stub_controller, encryptor)
+  def build_view(stub_controller)
     view = ActionView::Base.empty
-    view.singleton_class.include(ActionCable::SubscriptionAdapter::EnhancedPostgresql::ReliableBroadcasting::Helper)
+    view.singleton_class.include(ActionCable::SubscriptionAdapter::EnhancedPostgresql::Helper)
     view.define_singleton_method(:controller) { stub_controller }
-    view.define_singleton_method(:action_cable_param_encryptor) { encryptor }
     view
   end
 end
 
-class ReliableBroadcastingTimestampTest < ActionCable::TestCase
+class EnhancedPostgresqlTimestampTest < ActionCable::TestCase
   def test_format_and_parse_round_trip
     time = Time.now.utc
-    formatted = ReliableBroadcasting.format_timestamp(time)
+    formatted = EnhancedPostgresql.format_timestamp(time)
 
     assert_match(/\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z\z/, formatted)
-    assert_in_delta time.to_f, ReliableBroadcasting.parse_timestamp(formatted).to_f, 0.000002
+    assert_in_delta time.to_f, EnhancedPostgresql.parse_timestamp(formatted).to_f, 0.000002
   end
 
   def test_parse_timestamp_accepts_a_time_as_is
     time = Time.now
-    assert_equal time.utc, ReliableBroadcasting.parse_timestamp(time)
+    assert_equal time.utc, EnhancedPostgresql.parse_timestamp(time)
   end
 
   def test_parse_timestamp_returns_nil_for_nil_blank_or_garbage
-    assert_nil ReliableBroadcasting.parse_timestamp(nil)
-    assert_nil ReliableBroadcasting.parse_timestamp("")
-    assert_nil ReliableBroadcasting.parse_timestamp("yesterday")
-    assert_nil ReliableBroadcasting.parse_timestamp(42)
-  end
-
-  def test_since_param_value_accepts_the_primary_name_the_alternative_name_and_symbol_keys
-    assert_equal "x", ReliableBroadcasting.since_param_value({"enhanced-since" => "x"})
-    assert_equal "x", ReliableBroadcasting.since_param_value({enhanced_since: "x"})
-    assert_equal "x", ReliableBroadcasting.since_param_value({"enhanced_since" => "x"})
-    assert_nil ReliableBroadcasting.since_param_value({"since" => "x"})
-    assert_nil ReliableBroadcasting.since_param_value({})
+    assert_nil EnhancedPostgresql.parse_timestamp(nil)
+    assert_nil EnhancedPostgresql.parse_timestamp("")
+    assert_nil EnhancedPostgresql.parse_timestamp("yesterday")
+    assert_nil EnhancedPostgresql.parse_timestamp(42)
   end
 end
 
-class PresenceModuleTest < ActionCable::TestCase
+class EnhancedPostgresqlPresenceTokenTest < ActionCable::TestCase
   def test_encrypt_and_decrypt_round_trip
-    encryptor = build_encryptor
+    adapter = build_adapter
 
-    token = Presence.encrypt("alice", encryptor)
+    token = adapter.encrypt_presence("alice")
 
     refute_equal "alice", token
-    assert_equal "alice", Presence.decrypt(token, encryptor)
+    assert_equal "alice", adapter.decrypt_presence(token)
   end
 
   def test_encrypt_stringifies_the_value
-    encryptor = build_encryptor
+    adapter = build_adapter
 
-    token = Presence.encrypt(:alice, encryptor)
+    token = adapter.encrypt_presence(:alice)
 
-    assert_equal "alice", Presence.decrypt(token, encryptor)
+    assert_equal "alice", adapter.decrypt_presence(token)
   end
 
   def test_decrypt_returns_nil_for_nil_blank_or_garbage_tokens
-    encryptor = build_encryptor
+    adapter = build_adapter
 
-    assert_nil Presence.decrypt(nil, encryptor)
-    assert_nil Presence.decrypt("", encryptor)
-    assert_nil Presence.decrypt("garbage", encryptor)
+    assert_nil adapter.decrypt_presence(nil)
+    assert_nil adapter.decrypt_presence("")
+    assert_nil adapter.decrypt_presence("garbage")
   end
 
   def test_decrypt_returns_nil_for_a_blank_decrypted_value
-    encryptor = build_encryptor
+    adapter = build_adapter
 
-    assert_nil Presence.decrypt(Presence.encrypt("", encryptor), encryptor)
-    assert_nil Presence.decrypt(Presence.encrypt("   ", encryptor), encryptor)
+    assert_nil adapter.decrypt_presence(adapter.encrypt_presence(""))
+    assert_nil adapter.decrypt_presence(adapter.encrypt_presence("   "))
   end
 
   def test_decrypt_returns_nil_for_a_value_over_max_length
-    encryptor = build_encryptor
-    too_long = "a" * (Presence::MAX_LENGTH + 1)
+    adapter = build_adapter
+    max = EnhancedPostgresql::PRESENCE_MAX_LENGTH
+    too_long = "a" * (max + 1)
 
-    assert_nil Presence.decrypt(Presence.encrypt(too_long, encryptor), encryptor)
-    assert_equal "a" * Presence::MAX_LENGTH, Presence.decrypt(Presence.encrypt("a" * Presence::MAX_LENGTH, encryptor), encryptor)
+    assert_nil adapter.decrypt_presence(adapter.encrypt_presence(too_long))
+    assert_equal "a" * max, adapter.decrypt_presence(adapter.encrypt_presence("a" * max))
   end
 
   def test_decrypt_returns_nil_for_a_token_encrypted_with_a_different_secret
-    token = Presence.encrypt("alice", build_encryptor)
+    token = build_adapter.encrypt_presence("alice")
 
-    assert_nil Presence.decrypt(token, build_encryptor)
+    assert_nil build_adapter.decrypt_presence(token)
   end
 
   # `enhanced-since` is a plain, unencrypted ISO 8601 timestamp - it must never be accepted as a
-  # presence token (which requires an encrypted-and-signed value under Presence::PURPOSE).
+  # presence token (which requires an encrypted-and-signed value under a distinct purpose).
   def test_decrypt_returns_nil_for_a_since_value
-    encryptor = build_encryptor
-    since_value = ReliableBroadcasting.format_timestamp(Time.now.utc)
+    adapter = build_adapter
+    since_value = EnhancedPostgresql.format_timestamp(Time.now.utc)
 
-    assert_nil Presence.decrypt(since_value, encryptor)
-  end
-
-  def test_param_token_accepts_the_primary_name_the_alternative_name_and_symbol_keys
-    assert_equal "x", Presence.param_token({"enhanced-presence" => "x"})
-    assert_equal "x", Presence.param_token({enhanced_presence: "x"})
-    assert_equal "x", Presence.param_token({"enhanced_presence" => "x"})
-    assert_nil Presence.param_token({"presence" => "x"})
-    assert_nil Presence.param_token({})
+    assert_nil adapter.decrypt_presence(since_value)
   end
 
   def test_normalize_returns_nil_for_nil
-    assert_nil Presence.normalize(nil)
+    assert_nil EnhancedPostgresql.normalize_presence(nil)
   end
 
   def test_normalize_stringifies_non_string_values
-    assert_equal "42", Presence.normalize(42)
-    assert_equal "alice", Presence.normalize(:alice)
+    assert_equal "42", EnhancedPostgresql.normalize_presence(42)
+    assert_equal "alice", EnhancedPostgresql.normalize_presence(:alice)
   end
 
   def test_normalize_returns_nil_for_blank_after_stripping
-    assert_nil Presence.normalize("")
-    assert_nil Presence.normalize("   ")
+    assert_nil EnhancedPostgresql.normalize_presence("")
+    assert_nil EnhancedPostgresql.normalize_presence("   ")
   end
 
   def test_normalize_returns_nil_for_a_value_over_max_length
-    assert_nil Presence.normalize("a" * (Presence::MAX_LENGTH + 1))
-    assert_equal "a" * Presence::MAX_LENGTH, Presence.normalize("a" * Presence::MAX_LENGTH)
+    max = EnhancedPostgresql::PRESENCE_MAX_LENGTH
+    assert_nil EnhancedPostgresql.normalize_presence("a" * (max + 1))
+    assert_equal "a" * max, EnhancedPostgresql.normalize_presence("a" * max)
   end
 
   def test_normalize_passes_through_an_ordinary_string
-    assert_equal "alice", Presence.normalize("alice")
+    assert_equal "alice", EnhancedPostgresql.normalize_presence("alice")
   end
 
   private
 
-  def build_encryptor
-    ActiveSupport::MessageEncryptor.new(SecureRandom.random_bytes(32))
+  def build_adapter
+    server = ActionCable::Server::Base.new(config: ActionCable::Server::Configuration.new)
+    server.config.cable = {adapter: "enhanced_postgresql", payload_encryptor_secret: SecureRandom.hex(16)}.with_indifferent_access
+    server.config.logger = Logger.new(StringIO.new).tap { |l| l.level = Logger::UNKNOWN }
+    server.config.pubsub_adapter.new(server)
   end
 end
 
@@ -563,10 +577,8 @@ class ReliableBroadcastingRailtieTest < ActionCable::TestCase
   end
 end
 
-# Presence::Channel: touches (and heartbeats) presence for every stream a subscription is
-# streaming from, and removes it again on unsubscribe. Composes with ReliableBroadcasting::Channel
-# (see PresenceTestChannel above) - both override transmit_subscription_confirmation and
-# stop_stream_from/stop_all_streams, each calling super.
+# EnhancedPostgresql::Channel's presence half: touches (and heartbeats) presence for every
+# stream a subscription is streaming from, and removes it again on unsubscribe.
 class PresenceChannelTest < ActionCable::TestCase
   CONFIRMATION_TYPE = ActionCable::INTERNAL[:message_types][:confirmation]
 
@@ -746,11 +758,11 @@ class PresenceChannelTest < ActionCable::TestCase
   end
 
   # `enhanced-since` is a plain, unencrypted ISO 8601 timestamp - it must not be accepted as a
-  # presence token, which requires an encrypted-and-signed value (see Presence::PURPOSE).
+  # presence token, which requires an encrypted-and-signed value under a distinct purpose.
   def test_since_token_is_rejected_as_a_presence_token
     server = build_server
     room = unique_room
-    since_value = ReliableBroadcasting.format_timestamp(Time.now.utc)
+    since_value = EnhancedPostgresql.format_timestamp(Time.now.utc)
 
     connection, channel = build_channel(server, room: room, presence_token: since_value)
     channel.subscribe_to_channel
@@ -792,14 +804,14 @@ class PresenceChannelTest < ActionCable::TestCase
     assert_equal [], server.pubsub.presences(room)
   end
 
-  # A channel can override #enhanced_presence to compute its presence value in Ruby - e.g. from
-  # `current_user` - instead of trusting the frontend-supplied param. Here there's no presence
-  # param at all; the override alone is enough to register a presence.
-  def test_channel_can_override_enhanced_presence_to_compute_it_in_ruby
+  # A channel can declare `presence_identity serialize: ...` to compute its presence value in
+  # Ruby - e.g. from `current_user` - instead of trusting the frontend-supplied param. Here
+  # there's no presence param at all; the serializer alone is enough to register a presence.
+  def test_channel_can_declare_presence_identity_to_compute_it_in_ruby
     server = build_server
     room = unique_room
 
-    connection, channel = build_channel(server, room: room, channel_class: PresenceOverrideTestChannel)
+    connection, channel = build_channel(server, room: room, channel_class: PresenceIdentityTestChannel)
     connection.current_user_name = "carol"
     channel.subscribe_to_channel
 
@@ -809,13 +821,12 @@ class PresenceChannelTest < ActionCable::TestCase
     channel&.unsubscribe_from_channel
   end
 
-  # Whatever an #enhanced_presence override returns wins outright - the frontend's param is only
-  # consulted if the override calls `super`, which PresenceOverrideTestChannel does not.
-  def test_channel_override_wins_over_a_valid_frontend_presence_token
+  # A declared serializer wins outright over a valid frontend `enhanced-presence` token.
+  def test_presence_identity_serializer_wins_over_a_valid_frontend_presence_token
     server = build_server
     room = unique_room
 
-    connection, channel = build_channel(server, room: room, presence: "alice", channel_class: PresenceOverrideTestChannel)
+    connection, channel = build_channel(server, room: room, presence: "alice", channel_class: PresenceIdentityTestChannel)
     connection.current_user_name = "carol"
     channel.subscribe_to_channel
 
@@ -825,12 +836,26 @@ class PresenceChannelTest < ActionCable::TestCase
     channel&.unsubscribe_from_channel
   end
 
-  def test_channel_override_returning_nil_stores_nothing_and_starts_no_timer
+  # A serializer returning nil falls back to the frontend-supplied token, exactly as if no
+  # serializer had been declared at all.
+  def test_presence_identity_serializer_returning_nil_falls_back_to_frontend_token
     server = build_server
     room = unique_room
 
-    connection, channel = build_channel(server, room: room, channel_class: PresenceOverrideTestChannel)
-    connection.current_user_name = nil
+    connection, channel = build_channel(server, room: room, presence: "alice", channel_class: PresenceIdentityNilTestChannel)
+    channel.subscribe_to_channel
+
+    assert_confirmation(connection)
+    assert wait_for_presences(server, room, ["alice"])
+  ensure
+    channel&.unsubscribe_from_channel
+  end
+
+  def test_presence_identity_serializer_returning_nil_with_no_token_stores_nothing_and_starts_no_timer
+    server = build_server
+    room = unique_room
+
+    connection, channel = build_channel(server, room: room, channel_class: PresenceIdentityNilTestChannel)
     channel.subscribe_to_channel
 
     assert_confirmation(connection)
@@ -840,14 +865,13 @@ class PresenceChannelTest < ActionCable::TestCase
     assert_nil channel.instance_variable_get(:@enhanced_presence_timer)
   end
 
-  # #enhanced_presence is memoized (via #resolved_enhanced_presence) so an override - which might
-  # be an expensive or side-effecting call - runs exactly once per subscription, no matter how
-  # many heartbeats go by.
-  def test_channel_override_is_invoked_only_once_per_subscription_across_heartbeats
+  # `presence_identity` is memoized, so a serializer - which might be an expensive or
+  # side-effecting call - runs exactly once per subscription, no matter how many heartbeats go by.
+  def test_presence_identity_serializer_is_invoked_only_once_per_subscription_across_heartbeats
     server = build_server(presence_heartbeat_interval: 0.3)
     room = unique_room
 
-    connection, channel = build_channel(server, room: room, channel_class: PresenceOverrideTestChannel)
+    connection, channel = build_channel(server, room: room, channel_class: PresenceIdentityTestChannel)
     connection.current_user_name = "carol"
     channel.subscribe_to_channel
 
@@ -856,9 +880,73 @@ class PresenceChannelTest < ActionCable::TestCase
 
     sleep 1 # long enough for at least two more heartbeats at a 0.3s interval
 
-    assert_equal 1, channel.enhanced_presence_call_count
+    assert_equal 1, channel.presence_identity_call_count
   ensure
     channel&.unsubscribe_from_channel
+  end
+
+  # class_attribute gives each class its own, independently overridable serializer - a subclass
+  # declaring its own must not change the parent's.
+  def test_subclass_declaring_its_own_serializer_does_not_affect_the_parent
+    server = build_server
+    parent_room = unique_room
+    subclass_room = unique_room
+
+    parent_connection, parent_channel = build_channel(server, room: parent_room, channel_class: PresenceIdentityTestChannel)
+    parent_connection.current_user_name = "carol"
+    parent_channel.subscribe_to_channel
+    assert_confirmation(parent_connection)
+
+    subclass_connection, subclass_channel = build_channel(server, room: subclass_room, channel_class: PresenceIdentitySubclassTestChannel)
+    subclass_connection.current_user_name = "carol"
+    subclass_channel.subscribe_to_channel
+    assert_confirmation(subclass_connection)
+
+    assert wait_for_presences(server, parent_room, ["carol"])
+    assert wait_for_presences(server, subclass_room, ["subclass-carol"])
+  ensure
+    parent_channel&.unsubscribe_from_channel
+    subclass_channel&.unsubscribe_from_channel
+  end
+
+  # serialize: also accepts a Symbol, calling that method on the channel.
+  def test_presence_identity_serializer_accepts_a_symbol
+    server = build_server
+    room = unique_room
+
+    connection, channel = build_channel(server, room: room, channel_class: PresenceIdentitySymbolTestChannel)
+    connection.current_user_name = "carol"
+    channel.subscribe_to_channel
+
+    assert_confirmation(connection)
+    assert wait_for_presences(server, room, ["carol"])
+  ensure
+    channel&.unsubscribe_from_channel
+  end
+
+  # serialize: also accepts any object responding to #call, called with the channel itself.
+  def test_presence_identity_serializer_accepts_a_callable_object
+    server = build_server
+    room = unique_room
+
+    connection, channel = build_channel(server, room: room, channel_class: PresenceIdentityCallableTestChannel)
+    connection.current_user_name = "carol"
+    channel.subscribe_to_channel
+
+    assert_confirmation(connection)
+    assert wait_for_presences(server, room, ["carol"])
+  ensure
+    channel&.unsubscribe_from_channel
+  end
+
+  def test_presence_identity_declaration_rejects_an_uncallable_serializer
+    error = assert_raises(ArgumentError) do
+      Class.new(ActionCable::Channel::Base) do
+        include ActionCable::SubscriptionAdapter::EnhancedPostgresql::Channel
+        presence_identity serialize: "not callable"
+      end
+    end
+    assert_match(/serialize/, error.message)
   end
 
   private
@@ -879,9 +967,9 @@ class PresenceChannelTest < ActionCable::TestCase
     connection = FakeConnection.new(server)
     params = {"room" => room}
     if presence_token
-      params[Presence::PARAM] = presence_token
+      params[EnhancedPostgresql::PRESENCE_PARAM] = presence_token
     elsif presence != :none
-      params[Presence::PARAM] = Presence.encrypt(presence, server.pubsub.payload_encryptor)
+      params[EnhancedPostgresql::PRESENCE_PARAM] = server.pubsub.encrypt_presence(presence)
     end
     channel = channel_class.new(connection, '{"channel":"PresenceTestChannel"}', params.with_indifferent_access)
     [connection, channel]

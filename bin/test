@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Runs every test file, each in its own `bundle exec ruby` process - the system test boots a full
+# Rails app (test/dummy) and must not share a process with test/test_helper.rb, which forces the
+# "test" cable adapter for everything else. Continues past a failing file so one broken file
+# doesn't hide the results of the rest; exits non-zero if any file failed.
+#
+# Usage: bin/test [file ...]   (defaults to every test/*_test.rb and test/system/*_test.rb)
+
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+if [ "$#" -gt 0 ]; then
+  files=("$@")
+else
+  files=(test/*_test.rb test/system/*_test.rb)
+fi
+
+results=()
+failed=0
+
+for file in "${files[@]}"; do
+  echo "==> $file"
+  if bundle exec ruby "$file"; then
+    results+=("PASS $file")
+  else
+    results+=("FAIL $file")
+    failed=1
+  fi
+done
+
+echo
+echo "===== Summary ====="
+printf '%s\n' "${results[@]}"
+
+exit $failed

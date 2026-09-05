@@ -1,6 +1,7 @@
 # freeze_string_literal: true
 
 require "action_cable/subscription_adapter/postgresql"
+require "active_support/concern"
 require "connection_pool"
 require "time"
 
@@ -9,9 +10,6 @@ module ActionCable
     class EnhancedPostgresql < PostgreSQL
       MAX_NOTIFY_SIZE = 7997 # documented as 8000 bytes, but there appears to be some overhead in transit
       LARGE_PAYLOAD_PREFIX = "__large_payload:"
-      # MessageEncryptor `purpose:` stored broadcast payloads (both large payloads and, with
-      # reliable_broadcasting on, every payload) are encrypted-and-signed under, so they sit
-      # encrypted at rest in #{BROADCASTS_TABLE} - see #encrypt_stored_payload/#decrypt_stored_payload.
       BROADCAST_PAYLOAD_PURPOSE = "enhanced-broadcast"
       INSERTS_PER_DELETE = 100 # execute DELETE query every N inserts
       DEFAULT_MESSAGE_RETENTION = 120 # seconds
@@ -19,8 +17,6 @@ module ActionCable
       DEFAULT_PRESENCE_HEARTBEAT_INTERVAL = 30 # seconds
 
       BROADCASTS_TABLE = "action_cable_enhanced_broadcasts"
-      LEGACY_LARGE_PAYLOADS_TABLE = "action_cable_large_payloads" # only used for schema-dumper ignore + docs
-      LARGE_PAYLOADS_TABLE = BROADCASTS_TABLE # backwards-compatible alias
 
       CREATE_BROADCASTS_TABLE_QUERY = <<~SQL
         CREATE UNLOGGED TABLE IF NOT EXISTS #{BROADCASTS_TABLE} (
@@ -71,14 +67,11 @@ module ActionCable
       SQL
       DELETE_STALE_PRESENCES_QUERY = "DELETE FROM #{PRESENCES_TABLE} WHERE last_seen_at < CURRENT_TIMESTAMP - ($1::int * INTERVAL '1 second')"
 
-      # A single stored broadcast payload.
-      #
-      # id:         Integer primary key of the row in #{BROADCASTS_TABLE}
-      # channel:    the stored (prefixed, un-hashed) channel name
-      # payload:    the decrypted, raw (unescaped) broadcast payload, as passed to #broadcast -
-      #             stored, and read back, encrypted-and-signed at rest (see #payload_encryptor
-      #             and #decrypt_stored_payload)
-      # created_at: Time (UTC) the row was inserted, as recorded by the database
+      SINCE_PARAM = "enhanced-since"
+      PRESENCE_PARAM = "enhanced-presence"
+      PRESENCE_PURPOSE = "enhanced-presence"
+      PRESENCE_MAX_LENGTH = 255
+
       Message = Struct.new(:id, :channel, :payload, :created_at, keyword_init: true)
 
       def initialize(*)
@@ -95,22 +88,11 @@ module ActionCable
         @presence_touch_count = 0
       end
 
-      # Whether every broadcast payload (not only ones exceeding the NOTIFY size limit) is
-      # stored, making it possible to replay messages via #messages_since.
       def reliable_broadcasting?
         @reliable_broadcasting
       end
 
-      # Number of seconds stored messages are retained for before being eligible for deletion.
-      attr_reader :message_retention
-
-      # Number of seconds a presence stays listed (see #presences) without a heartbeat
-      # (#touch_presence) before it's considered gone.
-      attr_reader :presence_ttl
-
-      # Number of seconds between heartbeats a Presence::Channel subscription sends to keep its
-      # presence alive. May be a Float.
-      attr_reader :presence_heartbeat_interval
+      attr_reader :message_retention, :presence_ttl, :presence_heartbeat_interval
 
       def broadcast(channel, payload)
         channel = channel_with_prefix(channel)
@@ -121,9 +103,8 @@ module ActionCable
           large = escaped_payload.bytesize > MAX_NOTIFY_SIZE
 
           if reliable_broadcasting? || large
-            # Store the payload encrypted-and-signed at rest (never the escaped form - that would
-            # double quotes/backslashes for any payload containing them), so a row read straight
-            # out of the database can't be read or forged - see #encrypt_stored_payload.
+            # Store the raw payload, encrypted (never the escaped form) - so a row read straight
+            # out of the database can't be read or forged.
             message_id = insert_broadcast(pg_conn, channel, encrypt_stored_payload(payload))
 
             pg_conn.exec_params(DELETE_STALE_MESSAGES_QUERY, [message_retention]) if message_id % INSERTS_PER_DELETE == 0
@@ -139,26 +120,8 @@ module ActionCable
         end
       end
 
-      # Returns every stored message for +channel+ (the broadcasting name as passed to
-      # #broadcast; the channel_prefix, if any, is applied internally) with created_at >= +since+
-      # (anything responding to #utc, e.g. a Time), ordered by id ASC. Returns [] if nothing is
-      # stored, or if the broadcasts table doesn't exist (reliable_broadcasting was never enabled
-      # and no large payload was ever broadcast).
-      #
-      # +since+ is clamped to the retention window before the query runs: a value older than
-      # message_retention seconds ago (by the application clock, i.e. Time.now.utc - the same
-      # clock the ReliableBroadcasting::Controller-captured timestamp a client sends back is
-      # drawn from) is raised to that floor, and a value in the future is capped at now. This
-      # means a `since` older than the retention window returns only the retained window -
-      # which is the guarantee #messages_since already documented, just now enforced here rather
-      # than left to whatever hasn't been cleaned up yet - so direct callers of #messages_since
-      # get the same bound the Channel concern's replay does. A caller that genuinely wants
-      # everything currently retained can pass e.g. `Time.at(0)`.
-      #
-      # A row whose payload column fails to decrypt (e.g. it was written under a different
-      # payload_encryptor_secret, or the column somehow holds garbage) is skipped - logged as a
-      # warning rather than raised - since it can't be told apart from a forged row, and there is
-      # nothing sensible to replay it as.
+      # Every stored message for +channel+ with created_at >= +since+, ordered by id ASC. []
+      # if nothing is stored, or the broadcasts table doesn't exist yet.
       def messages_since(channel, since)
         channel = channel_with_prefix(channel)
         since = clamp_since_to_retention_window(since)
@@ -168,9 +131,8 @@ module ActionCable
 
           result.filter_map do |row|
             created_at = row["created_at"]
-            # ActiveRecord-backed connections (the common case) apply a type map that already
-            # casts timestamptz columns to Time; a plain PG::Connection (the `url:` option)
-            # returns the raw text representation instead.
+            # ActiveRecord connections type-cast timestamptz to Time; a raw PG::Connection
+            # returns the text representation instead.
             created_at = Time.parse(created_at) unless created_at.is_a?(Time)
 
             begin
@@ -181,25 +143,13 @@ module ActionCable
               next
             end
 
-            Message.new(
-              id: row["id"].to_i,
-              channel: row["channel"],
-              payload: payload,
-              created_at: created_at
-            )
+            Message.new(id: row["id"].to_i, channel: row["channel"], payload: payload, created_at: created_at)
           end
         end
       rescue PG::UndefinedTable
         []
       end
 
-      # Records (or refreshes) that +presence+ is present on +channel+ (the broadcasting name as
-      # passed to #broadcast; the channel_prefix, if any, is applied internally, and the value is
-      # stored un-hashed) for the given +subscription_key+ - a value unique per subscription
-      # (typically Presence::Channel's SecureRandom-generated key) so that the same +presence+
-      # value from two different subscriptions is tracked, and expires, independently, while
-      # still only being listed once by #presences. Periodically (every INSERTS_PER_DELETE calls)
-      # also deletes presences that haven't been touched within #presence_ttl seconds.
       def touch_presence(channel, presence, subscription_key)
         channel = channel_with_prefix(channel)
 
@@ -209,9 +159,6 @@ module ActionCable
         end
       end
 
-      # Removes the presence recorded by #touch_presence for this exact +channel+/+presence+/
-      # +subscription_key+ triple. A no-op (not an error) if the presences table doesn't exist
-      # yet or the row is already gone.
       def remove_presence(channel, presence, subscription_key)
         channel = channel_with_prefix(channel)
 
@@ -222,11 +169,6 @@ module ActionCable
         nil
       end
 
-      # Returns the sorted, de-duplicated list (Array<String>) of presence values currently
-      # recorded for +channel+ (the broadcasting name as passed to #broadcast; channel_prefix
-      # applied internally) whose most recent #touch_presence happened within #presence_ttl
-      # seconds. Returns [] if nothing is recorded, or if the presences table doesn't exist
-      # (no presence was ever touched).
       def presences(channel)
         channel = channel_with_prefix(channel)
 
@@ -270,10 +212,68 @@ module ActionCable
         pg_conn&.close
       end
 
+      # Time -> "2026-09-02T18:55:12.123456Z" (UTC, microsecond precision).
+      def self.format_timestamp(time)
+        time.utc.iso8601(6)
+      end
+
+      # Inverse of .format_timestamp. Accepts a Time or a String (ISO 8601). Returns nil (never
+      # raises) for nil/blank/unparseable input.
+      def self.parse_timestamp(value)
+        return value.utc if value.is_a?(Time)
+        return nil unless value.respond_to?(:to_str)
+
+        string = value.to_str
+        return nil if string.empty?
+
+        Time.iso8601(string).utc
+      rescue ArgumentError, TypeError
+        nil
+      end
+
+      # nil stays nil; anything else is converted with #to_s, then nil'd out if blank or over
+      # PRESENCE_MAX_LENGTH characters. Never raises.
+      def self.normalize_presence(value)
+        return nil if value.nil?
+
+        string = value.to_s
+        return nil if string.strip.empty? || string.length > PRESENCE_MAX_LENGTH
+
+        string
+      end
+
+      # value.to_s -> an encrypted-and-signed token safe to embed in HTML.
+      def encrypt_presence(value)
+        payload_encryptor.encrypt_and_sign(value.to_s, purpose: PRESENCE_PURPOSE)
+      end
+
+      # Inverse of #encrypt_presence. Returns a String, or nil if +token+ is missing, blank,
+      # doesn't decrypt/verify (wrong secret, wrong purpose - e.g. a `since` value - tampered
+      # with, or simply garbage), or normalizes away to nil. Never raises.
+      def decrypt_presence(token)
+        return nil unless token.respond_to?(:to_str)
+
+        string = token.to_str
+        return nil if string.empty?
+
+        value = payload_encryptor.decrypt_and_verify(string, purpose: PRESENCE_PURPOSE)
+        return nil unless value.is_a?(String)
+
+        self.class.normalize_presence(value)
+      rescue ActiveSupport::MessageEncryptor::InvalidMessage, ActiveSupport::MessageVerifier::InvalidSignature, ArgumentError, TypeError
+        nil
+      end
+
+      def encrypt_stored_payload(plaintext)
+        payload_encryptor.encrypt_and_sign(plaintext, purpose: BROADCAST_PAYLOAD_PURPOSE)
+      end
+
+      def decrypt_stored_payload(ciphertext)
+        payload_encryptor.decrypt_and_verify(ciphertext, purpose: BROADCAST_PAYLOAD_PURPOSE)
+      end
+
       private
 
-      # Clamps +since+ (anything responding to #utc, e.g. a Time) to
-      # [Time.now.utc - message_retention, Time.now.utc] - see #messages_since.
       def clamp_since_to_retention_window(since)
         now = Time.now.utc
         floor = now - message_retention
@@ -285,30 +285,12 @@ module ActionCable
         since
       end
 
-      # Encrypts-and-signs +plaintext+ (a broadcast payload) for storage in #{BROADCASTS_TABLE},
-      # under BROADCAST_PAYLOAD_PURPOSE - see #payload_encryptor.
-      def encrypt_stored_payload(plaintext)
-        payload_encryptor.encrypt_and_sign(plaintext, purpose: BROADCAST_PAYLOAD_PURPOSE)
-      end
-
-      # Inverse of #encrypt_stored_payload. Raises ActiveSupport::MessageEncryptor::InvalidMessage
-      # or ActiveSupport::MessageVerifier::InvalidSignature if +ciphertext+ doesn't decrypt/verify
-      # (wrong secret, wrong purpose, or simply garbage) - callers decide how to handle that (see
-      # #messages_since and Listener#invoke_callback).
-      def decrypt_stored_payload(ciphertext)
-        payload_encryptor.decrypt_and_verify(ciphertext, purpose: BROADCAST_PAYLOAD_PURPOSE)
-      end
-
       def connection_pool
         @connection_pool ||= ConnectionPool.new(size: @connection_pool_size, timeout: 5) do
           PG::Connection.new(@url)
         end
       end
 
-      # Ensures #{BROADCASTS_TABLE} (and its indexes) exist. Runs once per adapter instance,
-      # before the first insert, so table creation doesn't rely on an error inside a possibly-open
-      # application transaction. Rescues the race where a concurrent adapter instance created the
-      # table first.
       def ensure_broadcasts_table(pg_conn)
         return if @broadcasts_table_ensured
 
@@ -330,14 +312,10 @@ module ActionCable
         result = pg_conn.exec_params(INSERT_MESSAGE_QUERY, [channel, payload])
         result.first.fetch("id").to_i
       rescue PG::UndefinedTable
-        # The table was dropped at runtime (or this is the very first insert and the ensure
-        # above raced with something else) - create it and try again.
         create_broadcasts_table(pg_conn)
         retry
       end
 
-      # Ensures #{PRESENCES_TABLE} (and its index) exist. Runs once per adapter instance, mirrors
-      # #ensure_broadcasts_table above.
       def ensure_presences_table(pg_conn)
         return if @presences_table_ensured
 
@@ -357,7 +335,6 @@ module ActionCable
         @presence_touch_count += 1
         pg_conn.exec_params(DELETE_STALE_PRESENCES_QUERY, [presence_ttl]) if (@presence_touch_count % INSERTS_PER_DELETE).zero?
       rescue PG::UndefinedTable
-        # The table was dropped at runtime - create it and try again.
         create_presences_table(pg_conn)
         retry
       end
@@ -368,11 +345,8 @@ module ActionCable
       end
 
       class Listener < PostgreSQL::Listener
-        # Runs on the Listener thread, which has abort_on_exception = true (see
-        # PostgreSQL::Listener#initialize) - an unrescued exception here would take the whole
-        # process down. A forged/garbage `__large_payload:` NOTIFY (a spoofed id, an id whose row
-        # is gone, or a payload that fails to decrypt) is therefore never allowed to raise: it's
-        # logged as a warning and the message is dropped instead of delivered.
+        # The Listener thread has abort_on_exception = true, so a forged/garbage
+        # `__large_payload:` NOTIFY must never raise here - only be dropped.
         def invoke_callback(callback, message)
           if message.start_with?(LARGE_PAYLOAD_PREFIX)
             message = fetch_large_payload(message)
@@ -393,16 +367,51 @@ module ActionCable
           end
           return nil if row.nil?
 
-          @adapter.send(:decrypt_stored_payload, row.fetch("payload"))
+          @adapter.decrypt_stored_payload(row.fetch("payload"))
         rescue ActiveSupport::MessageEncryptor::InvalidMessage, ActiveSupport::MessageVerifier::InvalidSignature
           @adapter.logger.warn "#{self.class.name} dropped a `#{LARGE_PAYLOAD_PREFIX}` notification with an " \
             "undecryptable id or payload"
           nil
         end
       end
+
+      module Controller
+        extend ActiveSupport::Concern
+
+        included do
+          prepend_before_action :capture_action_cable_since if respond_to?(:prepend_before_action)
+          helper_method :action_cable_since if respond_to?(:helper_method)
+        end
+
+        def action_cable_since
+          @action_cable_since ||= Time.now.utc
+        end
+
+        private
+
+        def capture_action_cable_since
+          @action_cable_since = Time.now.utc
+        end
+      end
+
+      module Helper
+        def action_cable_enhanced_since_param
+          time = controller.action_cable_since if respond_to?(:controller) && controller.respond_to?(:action_cable_since)
+          EnhancedPostgresql.format_timestamp(time || (@action_cable_since ||= Time.now.utc))
+        end
+
+        def action_cable_enhanced_presence_param(value)
+          pubsub = ActionCable.server.pubsub
+
+          unless pubsub.respond_to?(:encrypt_presence)
+            raise "ActionCable.server.pubsub (#{pubsub.class}) does not support encrypted channel params - set `adapter: enhanced_postgresql` in cable.yml."
+          end
+
+          pubsub.encrypt_presence(value)
+        end
+      end
     end
   end
 end
 
-require_relative "enhanced_postgresql/reliable_broadcasting"
-require_relative "enhanced_postgresql/presence"
+require_relative "enhanced_postgresql/channel"

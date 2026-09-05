@@ -5,8 +5,8 @@
     enhanced_since: action_cable_enhanced_since_param,
     enhanced_presence: (action_cable_enhanced_presence_param(params[:name]) if params[:name].present?),
     # Forwarded to the channel as the `server_presence` param (turbo-rails snake_cases the
-    # dasherized data attribute name back on the way in) - read by the `enhanced_presence`
-    # override in config/initializers/reliable_turbo_streams.rb. Passed as plain text: unlike
+    # dasherized data attribute name back on the way in) - read by the `presence_identity`
+    # serializer in config/initializers/reliable_turbo_streams.rb. Passed as plain text: unlike
     # `enhanced_presence` above, the channel - not the frontend - decides the actual presence
     # value, so there's nothing here for a client to forge.
     server_presence: @server_presence.presence

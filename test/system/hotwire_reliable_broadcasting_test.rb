@@ -150,10 +150,9 @@ class HotwireReliableBroadcastingTest < ActionDispatch::SystemTestCase
     assert_eventually { ActionCable.server.pubsub.presences(room) == ["alice"] }
   end
 
-  # DummyServerPresence (config/initializers/reliable_turbo_streams.rb) overrides
-  # #enhanced_presence to compute the presence value in Ruby (from a channel param standing in
-  # for `current_user`) rather than trusting the frontend - no `name` param (and so no
-  # `enhanced-presence` token) is passed at all.
+  # The `presence_identity` serializer (config/initializers/reliable_turbo_streams.rb) computes
+  # the presence value in Ruby (from a channel param standing in for `current_user`) rather than
+  # trusting the frontend - no `name` param (and so no `enhanced-presence` token) is passed at all.
   def test_server_computed_presence_is_listed_without_a_frontend_presence_param
     room_id = SecureRandom.hex(8)
     room = "room-#{room_id}"
